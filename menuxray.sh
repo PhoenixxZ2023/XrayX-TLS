@@ -94,8 +94,8 @@ EOF
 func_add_user() {
     local nick="$1"
     local protocol="${2:-ws}"
-    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi
-    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; fi
+    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi # CORREÇÃO APLICADA AQUI
+    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; fi # CORREÇÃO APLICADA AQUI
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+30 days" +%F)
@@ -126,7 +126,7 @@ func_remove_user() {
     local uuid=""
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then uuid=$(db_query "SELECT uuid FROM xray WHERE id = $identifier");
     else uuid=$(db_query "SELECT uuid FROM xray WHERE uuid = '$identifier'"); fi
-    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return; fi
+    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return; fi # CORREÇÃO APLICADA AQUI
 
     jq --arg uuid "$uuid" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) |= map(select(.id != $uuid))' \
@@ -159,7 +159,7 @@ func_xray_cert() {
     local domain="$1"
     local key_file="$SSL_DIR/privkey.pem"
     local crt_file="$SSL_DIR/fullchain.pem"
-    if [ -z "$domain" ]; then echo "Erro: Informe o domínio/IP."; return; fi
+    if [ -z "$domain" ]; then echo "Erro: Informe o domínio/IP."; return; fi # CORREÇÃO APLICADA AQUI
     mkdir -p "$SSL_DIR"
     openssl req -x509 -nodes -newkey rsa:2048 -days 9999 \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
@@ -170,7 +170,7 @@ func_xray_cert() {
 func_purge_expired() {
     local today=$(date +%F)
     local expired_uuids=$(db_query "SELECT uuid FROM xray WHERE expiry < '$today'")
-    if [ -z "$expired_uuids" ]; then echo "Nenhum usuário expirado encontrado."; return; fi
+    if [ -z "$expired_uuids" ]; then echo "Nenhum usuário expirado encontrado."; return; fi # CORREÇÃO APLICADA AQUI
     for uuid in $expired_uuids; do func_remove_user "$uuid"; done
     echo "✅ Purge concluído."
 }

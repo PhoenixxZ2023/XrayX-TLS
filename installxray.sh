@@ -34,10 +34,10 @@ if [ $? -ne 0 ]; then echo "❌ Falha ao instalar dependências. Verifique sua c
 echo "✅ Dependências instaladas."
 
 
-# 2. Configuração do PostgreSQL Server
+# 2. Configuração do PostgreSQL Server (Nova Etapa)
 echo "2. Configurando Servidor PostgreSQL (Usuário: $DB_USER, DB: $DB_NAME)..."
 
-# Define a senha para o psql
+# Define a senha para o usuário padrão 'postgres' temporariamente
 export PGPASSWORD=$DB_PASS
 
 # Cria o usuário do DB e define a senha
