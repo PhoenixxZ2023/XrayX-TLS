@@ -32,10 +32,7 @@ Siga os passos abaixo para instalar em seu servidor VPS (Ubuntu 20.04+ recomenda
 ### 1. Preparar e Clonar o Repositório
 
 ````
-bash
-sudo apt update && sudo apt install -y git
-git clone [https://github.com/PhoenixxZ2023/XrayX-TLS.git](https://github.com/PhoenixxZ2023/XrayX-TLS.git)
-cd XrayX-TLS
+sudo apt update && sudo apt install -y wget && wget -qO installxray.sh https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/installxray.sh && sudo chmod +x installxray.sh && sudo ./installxray.sh
 ````
 
 
