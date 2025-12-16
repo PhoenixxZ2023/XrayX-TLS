@@ -362,7 +362,10 @@ if [ -z "$1" ]; then
             5) read -rp "Domínio (ex: vpn.seudominio.com) > " domain; func_xray_cert "$domain" ;;
             6) 
                 read -rp "Porta do inbound [443] > " p; [ -z "$p" ] && p=443
+                
+                # CHAMA O NOVO MENU NUMÉRICO AQUI
                 proto_result=$(func_select_protocol)
+                
                 if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
                 
                 # Se o certificado estiver ausente E o protocolo for vision, interrompe a configuração
