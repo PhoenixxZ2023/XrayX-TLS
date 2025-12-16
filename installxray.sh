@@ -1,5 +1,5 @@
 #!/bin/bash
-# installxray.sh - Instalador e Configuração (Corrigido para Auto-Install DB)
+# installxray.sh - Instalador e Configuração (Corrigido para Auto-Install DB e Auto-Fix)
 
 # --- Variáveis de Sistema ---
 XRAY_DIR="/opt/XrayTools"
@@ -34,10 +34,10 @@ if [ $? -ne 0 ]; then echo "❌ Falha ao instalar dependências. Verifique sua c
 echo "✅ Dependências instaladas."
 
 
-# 2. Configuração do PostgreSQL Server (Nova Etapa)
+# 2. Configuração do PostgreSQL Server
 echo "2. Configurando Servidor PostgreSQL (Usuário: $DB_USER, DB: $DB_NAME)..."
 
-# Define a senha para o usuário padrão 'postgres' temporariamente
+# Define a senha para o psql
 export PGPASSWORD=$DB_PASS
 
 # Cria o usuário do DB e define a senha
@@ -94,6 +94,12 @@ sed -i "s|{DB_USER}|$DB_USER|g" "$MENU_DESTINATION"
 sed -i "s|{DB_PASS}|$DB_PASS|g" "$MENU_DESTINATION"
 echo "✅ Variáveis de DB injetadas com sucesso."
 
+# --- APLICAÇÃO DA CORREÇÃO DE SINTAXE (SOLUÇÃO DE CONTINGÊNCIA) ---
+# Esta linha corrige o erro de sintaxe 'return; }' para 'return; fi' no menuxray.sh
+sed -i 's/return; }/return; fi/g' "$MENU_DESTINATION" 
+echo "-> Sintaxe do menuxray.sh corrigida automaticamente (reparo de contingência)."
+# ------------------------------------------------------------------
+
 # 6. CONFIGURAÇÃO FINAL
 echo "6. Configurando atalhos, permissões e cronjob..."
 chmod +x "$MENU_DESTINATION"
@@ -106,6 +112,7 @@ echo "-> Atalho 'xray-menu' criado em /bin."
 # Define a senha para que o 'menuxray.sh' possa se conectar imediatamente
 export PGPASSWORD=$DB_PASS
 # Inicializa a tabela do DB (chamando a função do menuxray.sh)
+# Esta chamada agora deve funcionar sem erro, graças à correção acima.
 "$MENU_DESTINATION" func_create_db_table >/dev/null
 unset PGPASSWORD
 
