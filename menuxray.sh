@@ -14,7 +14,7 @@ KEY_FILE="$SSL_DIR/privkey.pem"
 CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 DOMAIN_FILE="$XRAY_DIR/active_domain"
-PROTOCOL_FILE="$XRAY_DIR/active_protocol" # Novo arquivo para salvar o protocolo padrão
+PROTOCOL_FILE="$XRAY_DIR/active_protocol" 
 
 # Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
@@ -198,21 +198,23 @@ EOF
     systemctl restart xray 2>/dev/null
     
     echo "✅ Config Xray salvo (Porta $port, Protocolo $network, Domínio $domain)"
-    echo "🔔 Estas configurações (Porta: $port, Protocolo: $network) agora são o PADRÃO para novos usuários."
+    echo "🔔 Estas configurações (Porta: $port, Protocolo: $network, Domínio: $domain) agora são o PADRÃO para novos usuários."
 }
 
 func_add_user() {
     local nick="$1"
-    local expiry_days=${2:-30} # Novo: aceitar validade em dias
+    local expiry_days=${2:-30} 
     
     if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return 1; fi
     if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Configure o Xray Core (Opção 6) primeiro."; return 1; fi
 
     local domain=$(cat "$DOMAIN_FILE" 2>/dev/null)
     local protocol=$(cat "$PROTOCOL_FILE" 2>/dev/null)
-    
-    if [ -z "$protocol" ] || [ -z "$domain" ]; then 
-        echo "❌ Erro: Configurações padrão (Domínio/Protocolo) ausentes. Configure o Xray Core (Opção 6) primeiro."; 
+    local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null)
+
+    # Checa se o padrão foi definido
+    if [ -z "$protocol" ] || [ -z "$domain" ] || [ -z "$port" ]; then 
+        echo "❌ Erro: Configurações padrão (Porta/Domínio/Protocolo) ausentes. Configure o Xray Core (Opção 6) primeiro."; 
         return 1; 
     fi
 
@@ -225,8 +227,6 @@ func_add_user() {
 
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$protocol', '$domain')"
     systemctl restart xray 2>/dev/null
-
-    local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null)
     
     echo "✅ Usuário criado: $nick"
     echo "UUID: $uuid"
@@ -242,7 +242,7 @@ func_add_user() {
         echo "URI XHTTP: vless://${uuid}@${domain}:${port}?type=http&security=tls#${nick}"
     elif [ "$protocol" == "vision" ]; then
         # XTLS-Vision URI
-        echo "URI VISION: vless://${uuid}@${domain}:${port}?security=tls&flow=xtls-rprx-vision#${nick}"
+        echo "URI VISION: vless://${uuid}@${domain}:${port}?security=tls&flow=xtls-rprx-vision&encryption=none#${nick}"
     else # tcp
         echo "URI TCP: vless://${uuid}@${domain}:${port}#${nick}"
     fi
@@ -278,10 +278,13 @@ func_info() {
     local count=$(db_query "SELECT COUNT(*) FROM xray")
     local protocols=$(cat "$PROTOCOL_FILE" 2>/dev/null || echo "Nenhum")
     local domain=$(cat "$DOMAIN_FILE" 2>/dev/null || echo "Nenhum")
+    local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null || echo "Nenhum")
+    
     echo "--- Status do Sistema Xray ---"
     echo "Versão do Binário: $ver"
     echo "Total de Usuários: $count"
     echo "PROTOCOLO PADRÃO: $protocols"
+    echo "PORTA PADRÃO: $port"
     echo "DOMÍNIO PADRÃO: $domain"
     echo "-------------------------------"
 }
@@ -314,12 +317,45 @@ func_purge_expired() {
     echo "✅ Purge concluído."
 }
 
-# --- FUNÇÃO DE DESINSTALAÇÃO GERAL (omissão por brevidade) ---
-
 func_uninstall_xray() {
-    # ... (Código da desinstalação omitido por brevidade)
-    echo "Desinstalação omitida. Use o código anterior completo para desinstalar."
-    return
+    echo "========================================="
+    echo "⚠️ DESINSTALAÇÃO COMPLETA DO XRAY CORE (XRAYX-TLS)"
+    echo "========================================="
+    
+    systemctl stop xray 2>/dev/null
+    systemctl disable xray 2>/dev/null
+    echo "✅ Serviço Xray parado."
+
+    read -rp "Confirma a desinstalação de Xray, arquivos e DB? (S/N): " confirm
+    if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
+        echo "❌ Desinstalação cancelada."
+        return
+    fi
+
+    echo "Removendo binário Xray..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove >/dev/null 2>&1
+    rm -f /usr/local/bin/xray
+
+    echo "Limpando diretórios de configuração..."
+    rm -rf /usr/local/etc/xray
+    rm -rf "$XRAY_DIR"
+    rm -rf "$SSL_DIR"
+
+    echo "Removendo atalho e cronjob..."
+    rm -f /bin/xray-menu
+    (crontab -l 2>/dev/null | grep -v "menuxray.sh func_purge_expired") | crontab -
+
+    read -rp "Deseja APAGAR a tabela 'xray' no DB '$DB_NAME'? (S/N): " confirm_db
+    if [[ "$confirm_db" =~ ^[Ss]$ ]]; then
+        db_query "DROP TABLE IF EXISTS xray"
+        echo "✅ Tabela 'xray' removida do DB."
+    fi
+
+    echo ""
+    echo "========================================="
+    echo "🎉 DESINSTALAÇÃO CONCLUÍDA! Pronto para nova instalação."
+    echo "========================================="
+    exit 0
 }
 
 
@@ -336,7 +372,7 @@ menu_display() {
     echo "2. Remover Usuário Xray"
     echo "3. Listar Usuários Xray"
     echo "5. Gerar Certificado TLS (Autoassinado e Checagem DNS)"
-    echo "6. **Configurar Xray Core (Porta, Protocolo e Domínio PADRÃO)**"
+    echo "6. **Configurar Xray Core (Protocolo, Porta e Domínio PADRÃO)**"
     echo "8. Limpar Usuários Expirados (Purge)"
     
     echo "-----------------------------------------"
@@ -353,7 +389,7 @@ if [ -z "$1" ]; then
         
         case "$choice" in
             1) 
-                # Opção 1: Criar Usuário (USA O PADRÃO SALVO)
+                # Opção 1: Criar Usuário (AGORA SÓ PEDE NICK E VALIDADE)
                 read -rp "Nome do usuário > " nick 
                 read -rp "Validade em dias [30] > " expiry_days; [ -z "$expiry_days" ] && expiry_days=30
                 
@@ -367,22 +403,22 @@ if [ -z "$1" ]; then
                 func_xray_cert "$domain"
                 ;;
             6) 
-                # Opção 6: Configurar Xray Core (FLUXO NOVO GARANTIDO)
+                # Opção 6: Configurar Xray Core (FLUXO INVERTIDO E GARANTIDO)
                 
-                # 1. Porta
+                # 1. Protocolo (Menu Numérico)
+                proto_result=$(func_select_protocol)
+                if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
+                
+                # 2. Porta
                 read -rp "Porta do inbound [443] > " p; [ -z "$p" ] && p=443
                 
-                # 2. Domínio
+                # 3. Domínio
                 read -rp "Domínio FQDN apontando para este IP > " domain
                 if [ -z "$domain" ]; then 
                     echo "❌ Configuração abortada: Domínio é obrigatório."; 
                     read -rp "Pressione ENTER para retornar ao menu principal..."; 
                     continue; 
                 fi
-
-                # 3. Protocolo (Menu Numérico)
-                proto_result=$(func_select_protocol)
-                if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
                 
                 # 4. Checagens Específicas
                 if [ "$proto_result" == "vision" ] || [ "$proto_result" == "xhttp" ]; then
