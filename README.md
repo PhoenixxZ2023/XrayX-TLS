@@ -40,5 +40,5 @@ cd XrayX-TLS
 
 
 ````
-bash <(wget -qO- https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/ssh-plus)
+bash <(wget -qO- https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/installxray.sh)
 ````
