@@ -31,10 +31,13 @@ Siga os passos abaixo para instalar em seu servidor VPS (Ubuntu 20.04+ recomenda
 
 ### 1. Preparar e Clonar o Repositório
 
-```bash
+````
+bash
 sudo apt update && sudo apt install -y git
 git clone [https://github.com/PhoenixxZ2023/XrayX-TLS.git](https://github.com/PhoenixxZ2023/XrayX-TLS.git)
 cd XrayX-TLS
+````
+
 
 ````
 bash <(wget -qO- https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/refs/heads/main/ssh-plus)
