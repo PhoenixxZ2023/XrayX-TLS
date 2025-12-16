@@ -357,20 +357,22 @@ if [ -z "$1" ]; then
         
         case "$choice" in
             1) 
+                # Opção 1: Criar Usuário (AGORA USA O PADRÃO SALVO NA OPÇÃO 6)
                 read -rp "Nome do usuário > " nick 
                 read -rp "Validade em dias [30] > " expiry_days; [ -z "$expiry_days" ] && expiry_days=30
                 
-                # Usa o protocolo e domínio PADRÃO salvos
+                # Usa o protocolo e domínio PADRÃO salvos da Opção 6.
                 func_add_user "$nick" "$expiry_days" 
                 ;;
             2) read -rp "ID ou UUID para remover > " identifier; func_remove_user "$identifier" ;;
             3) func_list_users ;;
             5) 
+                # Opção 5: Gerar Certificado TLS (AGORA CHECA APONTAMENTO)
                 read -rp "Domínio FQDN (ex: vpn.seudominio.com) > " domain 
                 func_xray_cert "$domain"
                 ;;
             6) 
-                # NOVO FLUXO: Coleta de Domínio, Porta e Protocolo
+                # Opção 6: Configurar Xray Core (NOVO FLUXO COM MENU NUMÉRICO E DOMÍNIO)
                 
                 # 1. Porta
                 read -rp "Porta do inbound [443] > " p; [ -z "$p" ] && p=443
@@ -383,11 +385,22 @@ if [ -z "$1" ]; then
                     continue; 
                 fi
 
-                # 3. Protocolo (Menu Numérico)
+                # 3. Protocolo (Menu Numérico) - CHAMA func_select_protocol()
                 proto_result=$(func_select_protocol)
                 if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
                 
-                # 4. Checagens e Configuração
+                # 4. Checagens Específicas para protocolos TLS (Vision/XHTTP)
+                if [ "$proto_result" == "vision" ] || [ "$proto_result" == "xhttp" ]; then
+                    if ! func_check_cert "$proto_result"; then 
+                        read -rp "Pressione ENTER para retornar ao menu principal..."; 
+                        continue;
+                    fi
+                    if ! func_check_domain_ip "$domain"; then
+                        read -rp "Pressione ENTER para retornar ao menu principal...";
+                        continue;
+                    fi
+                fi
+
                 func_create_db_table
                 func_generate_config "$p" "$proto_result" "$domain"
                 ;;
