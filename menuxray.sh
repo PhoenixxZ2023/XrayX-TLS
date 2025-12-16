@@ -93,9 +93,9 @@ EOF
 
 func_add_user() {
     local nick="$1"
-    local protocol="${2:-ws}"
-    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi
-    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; fi
+    llocal protocol="${2:-ws}"
+    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi # <--- CORRIGIDO
+    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; fi # <--- CORRIGIDO
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+30 days" +%F)
