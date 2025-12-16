@@ -72,7 +72,7 @@ EOF
     {
       "tag": "inbound-dragoncore", "port": ($port | tonumber), "protocol": "vless",
       "settings": { "clients": [], "decryption": "none", "fallbacks": [] },
-      "streamSettings": $stream_settings
+      "streamSettings": $streamSettings
     }
   ],
   "outbounds": [{ "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "blocked" }],
@@ -93,13 +93,14 @@ EOF
 
 func_add_user() {
     local nick="$1"
-    llocal protocol="${2:-ws}"
-    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi # <--- CORRIGIDO
-    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; fi # <--- CORRIGIDO
+    local protocol="${2:-ws}"
+    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; }
+    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; }
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+30 days" +%F)
 
+    # CORREÇÃO DO ERRO JQ: Usamos 'nick_arg' para evitar conflito e garantir que o valor seja passado
     jq --arg uuid "$uuid" --arg nick_arg "$nick" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick_arg, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
@@ -107,6 +108,7 @@ func_add_user() {
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol) VALUES ('$uuid', '$nick', '$expiry', '$protocol')"
     systemctl restart xray 2>/dev/null
 
+    # CORREÇÃO DO URI: Obtém IP Público de forma confiável
     local public_ip=$(curl -s icanhazip.com)
     if [ -z "$public_ip" ]; then
         local public_ip=$(hostname -I | awk '{print $1}')
@@ -126,7 +128,7 @@ func_remove_user() {
     local uuid=""
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then uuid=$(db_query "SELECT uuid FROM xray WHERE id = $identifier");
     else uuid=$(db_query "SELECT uuid FROM xray WHERE uuid = '$identifier'"); fi
-    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return; fi
+    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return; }
 
     jq --arg uuid "$uuid" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) |= map(select(.id != $uuid))' \
@@ -159,7 +161,7 @@ func_xray_cert() {
     local domain="$1"
     local key_file="$SSL_DIR/privkey.pem"
     local crt_file="$SSL_DIR/fullchain.pem"
-    if [ -z "$domain" ]; then echo "Erro: Informe o domínio/IP."; return; fi
+    if [ -z "$domain" ]; then echo "Erro: Informe o domínio/IP."; return; }
     mkdir -p "$SSL_DIR"
     openssl req -x509 -nodes -newkey rsa:2048 -days 9999 \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
@@ -170,7 +172,7 @@ func_xray_cert() {
 func_purge_expired() {
     local today=$(date +%F)
     local expired_uuids=$(db_query "SELECT uuid FROM xray WHERE expiry < '$today'")
-    if [ -z "$expired_uuids" ]; then echo "Nenhum usuário expirado encontrado."; return; fi
+    if [ -z "$expired_uuids" ]; then echo "Nenhum usuário expirado encontrado."; return; }
     for uuid in $expired_uuids; do func_remove_user "$uuid"; done
     echo "✅ Purge concluído."
 }
