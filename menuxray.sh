@@ -101,14 +101,21 @@ func_add_user() {
     local expiry=$(date -d "+30 days" +%F)
 
     jq --arg uuid "$uuid" --arg email "$nick" \
-       '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $email, "level": 0}]' \
+       '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol) VALUES ('$uuid', '$nick', '$expiry', '$protocol')"
     systemctl restart xray 2>/dev/null
 
-    local domain=$(hostname -I | awk '{print $1}')
-    [ -z "$domain" ] && domain="127.0.0.1"
+    # CORREÇÃO CRÍTICA: Obtém IP Público de forma confiável
+    local public_ip=$(curl -s icanhazip.com)
+    if [ -z "$public_ip" ]; then
+        # Fallback para o IP local/interno, mas informa ao usuário
+        local public_ip=$(hostname -I | awk '{print $1}')
+        echo "⚠️ Aviso: Falha ao obter IP público externo. Usando IP interno/local: $public_ip"
+    fi
+
+    local domain="${public_ip}" 
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null)
     
     echo "✅ Usuário criado: $nick"
@@ -170,7 +177,7 @@ func_purge_expired() {
     echo "✅ Purge concluído."
 }
 
-# --- FUNÇÃO DE DESINSTALAÇÃO GERAL (NOVA) ---
+# --- FUNÇÃO DE DESINSTALAÇÃO GERAL ---
 
 func_uninstall_xray() {
     echo "========================================="
@@ -260,14 +267,12 @@ if [ -z "$1" ]; then
                 func_create_db_table; func_generate_config "$p" "$pr"
                 ;;
             8) func_purge_expired ;;
-            9) func_uninstall_xray ;; # Chama a nova função de desinstalação
+            9) func_uninstall_xray ;; 
             0) echo "Saindo. Até logo!"; exit 0 ;;
             *) echo "Opção inválida. Tente novamente." ;;
         esac
-        # Condição ajustada para não pedir ENTER após a desinstalação (opção 9)
         if [ "$choice" != "0" ] && [ "$choice" != "9" ]; then read -rp "Pressione ENTER para voltar ao menu..."; fi
     done
 else
-    # Permite chamar funções como CLI (usado pelo instalador e pelo cronjob)
     "$1" "${@:2}"
 fi
