@@ -2,7 +2,6 @@
 # menuxray.sh - Menu Interativo e Lógica Xray (Backend e Frontend)
 
 # --- Variáveis de Ambiente (Preenchidas pelo instalador) ---
-# O instalador irá substituir estas credenciais
 DB_HOST="{DB_HOST}"
 DB_NAME="{DB_NAME}"
 DB_USER="{DB_USER}"
@@ -11,6 +10,8 @@ DB_PASS="{DB_PASS}"
 XRAY_BIN="/usr/local/bin/xray"
 CONFIG_PATH="/usr/local/etc/xray/config.json"
 SSL_DIR="/opt/DragonCoreSSL"
+KEY_FILE="$SSL_DIR/privkey.pem"
+CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 
 # Variável de Senha para psql
@@ -30,13 +31,59 @@ func_create_db_table() {
 
 func_is_installed() { [ -f "$XRAY_BIN" ] || [ -f "/usr/bin/xray" ]; }
 
+# FUNÇÃO PARA SELECIONAR PROTOCOLO POR NÚMEROS
+func_select_protocol() {
+    clear
+    echo "========================================="
+    echo "⚙️  Seleção de Protocolo de Transporte"
+    echo "========================================="
+    echo "1. ws (WebSocket) - Boa Compatibilidade"
+    echo "2. grpc (gRPC) - ✅ RECOMENDADO: Alto Desempenho e Resiliência"
+    echo "3. xhttp (TCP c/ Camuflagem) - Alternativa ao WS"
+    echo "4. tcp (TCP Simples) - APENAS para testes/fallback"
+    echo "5. vision (XTLS-Vision) - 🚀 Mais Avançado (Requer Certificado TLS)"
+    echo "0. Cancelar"
+    echo "-----------------------------------------"
+    read -rp "Digite o número da opção: " choice
+    
+    case "$choice" in
+        1) echo "ws" ;;
+        2) echo "grpc" ;;
+        3) echo "xhttp" ;;
+        4) echo "tcp" ;;
+        5) echo "vision" ;;
+        0) echo "cancel" ;;
+        *) echo "invalid" ;;
+    esac
+}
+
+func_check_cert() {
+    if [ ! -f "$KEY_FILE" ] || [ ! -f "$CRT_FILE" ]; then
+        echo "=========================================================================="
+        echo "❌ AVISO CRÍTICO: Certificado TLS Ausente!"
+        echo "O protocolo '$1' (XTLS-Vision) **REQUER** um certificado TLS válido."
+        echo "Por favor, retorne ao Menu Principal e use a **Opção 5** para gerar o certificado TLS autoassinado."
+        echo "=========================================================================="
+        return 1
+    fi
+    return 0
+}
+
 func_generate_config() {
     local port=${1:-443}
     local network=${2:-ws}
     local stream_settings=""
 
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then port=443; fi
-    case "$network" in ws|xhttp|grpc|tcp) ;; *) network="ws" ;; esac
+    case "$network" in ws|xhttp|grpc|tcp|vision) ;; *) network="ws" ;; esac
+    
+    # Checagem de certificado para Vision antes de gerar a config
+    if [ "$network" == "vision" ]; then
+        if ! func_check_cert "XTLS-Vision"; then
+            echo "❌ Configuração abortada. Gere o certificado primeiro."
+            return 1
+        fi
+    fi
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
@@ -45,7 +92,7 @@ func_generate_config() {
             {
                 "network": "xhttp", "security": "tls",
                 "tlsSettings": {
-                    "certificates": [{"certificateFile": "$SSL_DIR/fullchain.pem", "keyFile": "$SSL_DIR/privkey.pem"}],
+                    "certificates": [{"certificateFile": "$CRT_FILE", "keyFile": "$KEY_FILE"}],
                     "alpn": ["http/1.1"]
                 },
                 "xhttpSettings": {"path": "/", "scMaxBufferedPosts": 30, "scMaxEachPostBytes": "1000000", "scStreamUpServerSecs": "20-80", "xPaddingBytes": "100-1000"}
@@ -60,18 +107,45 @@ EOF
             }
 EOF
         )
-    else
-        stream_settings='{ "network": "'"$network"'", "security": "none" }'
+    elif [ "$network" == "grpc" ]; then
+        stream_settings=$(cat <<EOF
+            {
+                "network": "grpc", "security": "none",
+                "grpcSettings": {"serviceName": "gRPC"}
+            }
+EOF
+        )
+    elif [ "$network" == "vision" ]; then
+        # XTLS-Vision (TCP + TLS + Flow Control)
+        stream_settings=$(cat <<EOF
+            {
+                "network": "tcp", "security": "tls",
+                "tlsSettings": {
+                    "certificates": [{"certificateFile": "$CRT_FILE", "keyFile": "$KEY_FILE"}],
+                    "minVersion": "1.2", "allowInsecure": true
+                },
+                "tcpSettings": {"header": {"type": "none"}},
+                "realitySettings": null
+            }
+EOF
+        )
+    else # tcp (TCP Simples)
+        stream_settings='{ "network": "tcp", "security": "none" }'
     fi
 
-    jq -n --argjson streamSettings "$stream_settings" --arg port "$port" '
+    jq -n --argjson streamSettings "$stream_settings" --arg port "$port" --arg network "$network" '
 {
   "api": { "services": [ "HandlerService", "LoggerService", "StatsService" ], "tag": "api" },
   "inbounds": [
     { "tag": "api", "port": 1080, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "listen": "127.0.0.1" },
     {
       "tag": "inbound-dragoncore", "port": ($port | tonumber), "protocol": "vless",
-      "settings": { "clients": [], "decryption": "none", "fallbacks": [] },
+      "settings": { 
+          "clients": [], 
+          "decryption": "none", 
+          "fallbacks": [],
+          "flow": ($network == "vision" ? "xtls-rprx-vision" : "")
+      },
       "streamSettings": $stream_settings
     }
   ],
@@ -97,6 +171,14 @@ func_add_user() {
     if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi
     if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Gere a configuração primeiro."; return; fi
 
+    # Checagem de certificado para Vision antes de adicionar o usuário
+    if [ "$protocol" == "vision" ]; then
+        if ! func_check_cert "XTLS-Vision"; then
+            echo "❌ Usuário não criado. Gere o certificado primeiro."
+            return
+        fi
+    fi
+
     local uuid=$(uuidgen)
     local expiry=$(date -d "+30 days" +%F)
 
@@ -118,14 +200,30 @@ func_add_user() {
     
     echo "✅ Usuário criado: $nick"
     echo "UUID: $uuid"
-    echo "URI: vless://${uuid}@${domain}:${port}#${nick}"
+    echo "PROTOCOLO: $protocol"
+    
+    # URI Format based on protocol (VLESS is the base)
+    if [ "$protocol" == "grpc" ]; then
+        echo "URI gRPC: vless://${uuid}@${domain}:${port}?type=grpc&serviceName=gRPC#${nick}"
+    elif [ "$protocol" == "ws" ]; then
+        echo "URI WS: vless://${uuid}@${domain}:${port}?type=ws&path=/#${nick}"
+    elif [ "$protocol" == "xhttp" ]; then
+        echo "URI XHTTP: vless://${uuid}@${domain}:${port}?type=http&security=tls#${nick}"
+    elif [ "$protocol" == "vision" ]; then
+        # XTLS-Vision URI
+        echo "URI VISION: vless://${uuid}@${domain}:${port}?security=tls&flow=xtls-rprx-vision#${nick}"
+    else # tcp
+        echo "URI TCP: vless://${uuid}@${domain}:${port}#${nick}"
+    fi
 }
 
 func_remove_user() {
     local identifier="$1"
     local uuid=""
+    # Busca por ID ou UUID
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then uuid=$(db_query "SELECT uuid FROM xray WHERE id = $identifier");
     else uuid=$(db_query "SELECT uuid FROM xray WHERE uuid = '$identifier'"); fi
+    
     if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return; fi
 
     jq --arg uuid "$uuid" \
@@ -157,14 +255,12 @@ func_info() {
 
 func_xray_cert() {
     local domain="$1"
-    local key_file="$SSL_DIR/privkey.pem"
-    local crt_file="$SSL_DIR/fullchain.pem"
     if [ -z "$domain" ]; then echo "Erro: Informe o domínio/IP."; return; fi
     mkdir -p "$SSL_DIR"
     openssl req -x509 -nodes -newkey rsa:2048 -days 9999 \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
-        -keyout "$key_file" -out "$crt_file" 2>/dev/null
-    if [ -f "$key_file" ] && [ -f "$crt_file" ]; then echo "✅ Certificado TLS autoassinado gerado para $domain"; else echo "❌ Falha ao gerar certificado."; fi
+        -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
+    if [ -f "$KEY_FILE" ] && [ -f "$CRT_FILE" ]; then echo "✅ Certificado TLS autoassinado gerado para $domain"; else echo "❌ Falha ao gerar certificado."; fi
 }
 
 func_purge_expired() {
@@ -239,7 +335,7 @@ menu_display() {
     echo "2. Remover Usuário Xray"
     echo "3. Listar Usuários Xray"
     echo "5. Gerar Certificado TLS (Autoassinado)"
-    echo "6. Configurar Xray Core (Porta/Protocolo)"
+    echo "6. Configurar Xray Core (Porta e Protocolo Principal)"
     echo "8. Limpar Usuários Expirados (Purge)"
     
     echo "-----------------------------------------"
@@ -255,14 +351,27 @@ if [ -z "$1" ]; then
         menu_display
         
         case "$choice" in
-            1) read -rp "Nome do usuário > " nick; read -rp "Protocolo (ws/xhttp/grpc/tcp) [ws] > " proto; func_add_user "$nick" "${proto:-ws}" ;;
+            1) 
+                read -rp "Nome do usuário > " nick 
+                proto_result=$(func_select_protocol)
+                if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
+                func_add_user "$nick" "$proto_result" 
+                ;;
             2) read -rp "ID ou UUID para remover > " identifier; func_remove_user "$identifier" ;;
             3) func_list_users ;;
             5) read -rp "Domínio (ex: vpn.seudominio.com) > " domain; func_xray_cert "$domain" ;;
             6) 
                 read -rp "Porta do inbound [443] > " p; [ -z "$p" ] && p=443
-                read -rp "Protocolo (ws/xhttp/grpc/tcp) [ws] > " pr; [ -z "$pr" ] && pr="ws"
-                func_create_db_table; func_generate_config "$p" "$pr"
+                proto_result=$(func_select_protocol)
+                if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
+                
+                # Se o certificado estiver ausente E o protocolo for vision, interrompe a configuração
+                if [ "$proto_result" == "vision" ] && ! func_check_cert "XTLS-Vision"; then 
+                    read -rp "Pressione ENTER para retornar ao menu principal..."; 
+                    continue;
+                fi
+
+                func_create_db_table; func_generate_config "$p" "$proto_result"
                 ;;
             8) func_purge_expired ;;
             9) func_uninstall_xray ;; 
