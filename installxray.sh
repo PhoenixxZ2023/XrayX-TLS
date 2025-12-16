@@ -1,22 +1,24 @@
 #!/bin/bash
-# installxray.sh - Instalador e Configuração (Corrigido para Auto-Install DB e Auto-Fix)
+# installxray.sh - Instalador e Configuração (Versão Corrigida)
+# Autor: Adaptado para DragonCore Xray
 
-# --- Variáveis de Sistema ---
+# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
+# Nota: Usamos 127.0.0.1 para forçar autenticação via senha (TCP), 
+# evitando erros de 'peer authentication' do localhost.
+DB_HOST="127.0.0.1"
+DB_NAME="dragoncore"
+DB_USER="root"
+DB_PASS="senha"  # <-- Altere sua senha aqui se desejar
+
+# --- VARIÁVEIS DE SISTEMA ---
 XRAY_DIR="/opt/XrayTools"
-MENU_SOURCE="./menuxray.sh"
+MENU_LOCAL="./menuxray.sh"
 MENU_DESTINATION="$XRAY_DIR/menuxray.sh"
 MENU_GITHUB_URL="https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/menuxray.sh"
 
-# --- CONFIGURAÇÃO (AJUSTE AQUI AS CREDENCIAIS DO SEU BANCO) ---
-DB_HOST="localhost"
-DB_NAME="dragoncore"
-DB_USER="root"
-DB_PASS="senha"
-# -----------------------------------------------------------------
-
-# Checagem de privilégio Root
+# --- 1. CHECAGEM DE ROOT ---
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ Por favor, execute este script como root ou com sudo."
+  echo "❌ Execute como root (sudo -i)."
   exit 1
 fi
 
@@ -24,107 +26,100 @@ echo "=================================================="
 echo "🚀 Instalador DragonCore Xray (Bash Nativo)"
 echo "=================================================="
 
-# 1. Instalação de dependências essenciais, incluindo o PostgreSQL Server
-echo "1. Instalando Dependências essenciais (Xray, DB e utilitários)..."
-apt update
-# Instala o Servidor PostgreSQL, o Cliente e as dependências do script
-apt install -y uuid-runtime curl jq net-tools openssl wget postgresql postgresql-contrib
+# --- 2. INSTALAÇÃO DE DEPENDÊNCIAS ---
+echo "1. Instalando Dependências..."
+apt update -y
+apt install -y uuid-runtime curl jq net-tools openssl wget postgresql postgresql-contrib socat
 
-if [ $? -ne 0 ]; then echo "❌ Falha ao instalar dependências. Verifique sua conexão ou repositórios."; exit 1; fi
+if [ $? -ne 0 ]; then 
+    echo "❌ Falha no apt install. Verifique sua internet."
+    exit 1
+fi
 echo "✅ Dependências instaladas."
 
+# --- 3. CONFIGURAÇÃO DO POSTGRESQL ---
+echo "2. Configurando Banco de Dados..."
 
-# 2. Configuração do PostgreSQL Server
-echo "2. Configurando Servidor PostgreSQL (Usuário: $DB_USER, DB: $DB_NAME)..."
+# Inicia serviço se estiver parado
+systemctl start postgresql 
+systemctl enable postgresql
 
-# Define a senha para o psql
+# Define senha do ambiente para comandos psql
 export PGPASSWORD=$DB_PASS
 
-# Cria o usuário do DB e define a senha
+# Cria usuário (se não existir)
 sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" 2>/dev/null
-if [ $? -ne 0 ]; then echo "⚠️ Aviso: Usuário '$DB_USER' já existia ou falha na criação. Prosseguindo..."; fi
-
-# Cria a base de dados e define o owner
+# Cria banco (se não existir)
 sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null
-if [ $? -ne 0 ]; then echo "⚠️ Aviso: Banco de dados '$DB_NAME' já existia ou falha na criação. Prosseguindo..."; fi
 
-# Limpa a variável de ambiente de senha
 unset PGPASSWORD
+echo "✅ PostgreSQL configurado (User: $DB_USER / DB: $DB_NAME)."
 
-echo "✅ PostgreSQL Server configurado."
+# --- 4. PREPARAÇÃO DO MENU ---
+echo "3. Preparando arquivos do Menu..."
 
+mkdir -p "$XRAY_DIR"
 
-# 3. Checagem e Download do menuxray.sh
-echo "3. Verificando e baixando o menuxray.sh..."
-
-if [ ! -f "$MENU_SOURCE" ]; then
-    echo "-> Arquivo '$MENU_SOURCE' não encontrado localmente. Baixando do GitHub..."
-    wget -qO "$MENU_SOURCE" "$MENU_GITHUB_URL"
-    
-    if [ $? -ne 0 ] || [ ! -f "$MENU_SOURCE" ]; then
-        echo "❌ ERRO CRÍTICO: Não foi possível baixar o menuxray.sh do GitHub."
-        echo "Instalação abortada."
-        exit 1
-    fi
-    echo "✅ menuxray.sh baixado com sucesso."
+# Lógica: Usa o arquivo local se existir (prioridade dev), senão baixa
+if [ -f "$MENU_LOCAL" ]; then
+    echo "-> Usando arquivo local '$MENU_LOCAL'."
+    cp "$MENU_LOCAL" "$MENU_DESTINATION"
+else
+    echo "-> Arquivo local não encontrado. Baixando do GitHub..."
+    wget -qO "$MENU_DESTINATION" "$MENU_GITHUB_URL"
 fi
 
-# 4. Instalação do Binário Xray Core
+if [ ! -f "$MENU_DESTINATION" ]; then
+    echo "❌ Erro crítico: menuxray.sh não encontrado em $MENU_DESTINATION"
+    exit 1
+fi
+
+# --- 5. INSTALAÇÃO DO XRAY CORE ---
 if ! command -v xray &> /dev/null; then
     echo "4. Instalando Xray Core..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    if [ $? -ne 0 ]; then echo "❌ Falha na instalação do Xray."; exit 1; fi
     echo "✅ Xray Core instalado."
 else
-    echo "4. Xray Core já está instalado. Prosseguindo..."
+    echo "4. Xray Core já está instalado."
 fi
 
-# --- 5. CÓPIA E CONFIGURAÇÃO DO ARQUIVO DE MENU ---
-mkdir -p "$XRAY_DIR"
-echo "5. Copiando '$MENU_SOURCE' para '$MENU_DESTINATION' e configurando DB..."
+# --- 6. INJEÇÃO DE VARIÁVEIS NO MENU ---
+echo "5. Configurando conexões..."
 
-# Cópia do arquivo
-cp "$MENU_SOURCE" "$MENU_DESTINATION"
-
-# Injeção das Variáveis de Credencial no arquivo copiado
-echo "-> Injetando credenciais do DB (DB: $DB_NAME, User: $DB_USER)..."
+# Substitui os placeholders no arquivo final
 sed -i "s|{DB_HOST}|$DB_HOST|g" "$MENU_DESTINATION"
 sed -i "s|{DB_NAME}|$DB_NAME|g" "$MENU_DESTINATION"
 sed -i "s|{DB_USER}|$DB_USER|g" "$MENU_DESTINATION"
 sed -i "s|{DB_PASS}|$DB_PASS|g" "$MENU_DESTINATION"
-echo "✅ Variáveis de DB injetadas com sucesso."
 
-# --- APLICAÇÃO DA CORREÇÃO DE SINTAXE (SOLUÇÃO DE CONTINGÊNCIA) ---
-# Esta linha corrige o erro de sintaxe 'return; }' para 'return; fi' no menuxray.sh
-sed -i 's/return; }/return; fi/g' "$MENU_DESTINATION" 
-echo "-> Sintaxe do menuxray.sh corrigida automaticamente (reparo de contingência)."
-# ------------------------------------------------------------------
-
-# 6. CONFIGURAÇÃO FINAL
-echo "6. Configurando atalhos, permissões e cronjob..."
 chmod +x "$MENU_DESTINATION"
+echo "✅ Credenciais injetadas no script."
 
-# Cria o atalho /bin/xray-menu
-echo -n "$MENU_DESTINATION" > /bin/xray-menu
+# --- 7. CRIAÇÃO DE ATALHO E CRON ---
+echo "6. Finalizando..."
+
+# CORREÇÃO: Criação de Link Simbólico (Maneira correta)
+rm -f /bin/xray-menu
+ln -sf "$MENU_DESTINATION" /bin/xray-menu
 chmod +x /bin/xray-menu
-echo "-> Atalho 'xray-menu' criado em /bin."
 
-# Define a senha para que o 'menuxray.sh' possa se conectar imediatamente
+# Inicializa tabela do banco executando a função interna do menu
 export PGPASSWORD=$DB_PASS
-# Inicializa a tabela do DB (chamando a função do menuxray.sh)
-# Esta chamada agora deve funcionar sem erro, graças à correção acima.
-"$MENU_DESTINATION" func_create_db_table >/dev/null
+"$MENU_DESTINATION" func_create_db_table
+if [ $? -eq 0 ]; then
+    echo "✅ Tabela de dados inicializada."
+else
+    echo "⚠️  Aviso: Não foi possível inicializar a tabela agora. O menu tentará novamente ao abrir."
+fi
 unset PGPASSWORD
 
-# Adiciona o Cronjob de limpeza (Limpeza diária à 1h da manhã)
-EXISTING_PURGE_CRON=$(crontab -l 2>/dev/null | grep -F "menuxray.sh func_purge_expired")
-if [ -z "$EXISTING_PURGE_CRON" ]; then
-    (crontab -l 2>/dev/null; echo "0 1 * * * $MENU_DESTINATION func_purge_expired > /dev/null 2>&1") | crontab -
-    echo "-> Tarefa Cron de limpeza diária adicionada."
-fi
+# Cronjob para limpeza automática (Diariamente 01:00 AM)
+CRON_CMD="$MENU_DESTINATION func_purge_expired > /dev/null 2>&1"
+(crontab -l 2>/dev/null | grep -v "func_purge_expired"; echo "0 1 * * * $CRON_CMD") | crontab -
 
 echo ""
 echo "=================================================="
-echo "🎉 Instalação Xray Concluída!"
-echo "Para acessar o menu, digite o comando: **sudo xray-menu**"
+echo "🎉 INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
+echo "=================================================="
+echo "Comando para acessar: xray-menu"
 echo "=================================================="
