@@ -108,11 +108,7 @@ func_generate_config() {
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then port=443; fi
     case "$network" in ws|xhttp|grpc|tcp|vision) ;; *) network="ws" ;; esac
     
-    # 1. Checagens de Requisito
-    if [ "$network" == "vision" ] || [ "$network" == "xhttp" ]; then
-        if ! func_check_cert "$network"; then return 1; fi
-        if ! func_check_domain_ip "$domain"; then return 1; fi
-    fi
+    # 1. Checagens de Requisito (Já feitas no LOOP principal)
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
     
@@ -209,15 +205,15 @@ func_add_user() {
     local nick="$1"
     local expiry_days=${2:-30} # Novo: aceitar validade em dias
     
-    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return; fi
-    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Configure o Xray Core (Opção 6) primeiro."; return; fi
+    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return 1; fi
+    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Configure o Xray Core (Opção 6) primeiro."; return 1; fi
 
     local domain=$(cat "$DOMAIN_FILE" 2>/dev/null)
     local protocol=$(cat "$PROTOCOL_FILE" 2>/dev/null)
     
     if [ -z "$protocol" ] || [ -z "$domain" ]; then 
         echo "❌ Erro: Configurações padrão (Domínio/Protocolo) ausentes. Configure o Xray Core (Opção 6) primeiro."; 
-        return; 
+        return 1; 
     fi
 
     local uuid=$(uuidgen)
@@ -259,7 +255,7 @@ func_remove_user() {
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then uuid=$(db_query "SELECT uuid FROM xray WHERE id = $identifier");
     else uuid=$(db_query "SELECT uuid FROM xray WHERE uuid = '$identifier'"); fi
     
-    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return; fi
+    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return 1; fi
 
     jq --arg uuid "$uuid" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) |= map(select(.id != $uuid))' \
@@ -357,22 +353,21 @@ if [ -z "$1" ]; then
         
         case "$choice" in
             1) 
-                # Opção 1: Criar Usuário (AGORA USA O PADRÃO SALVO NA OPÇÃO 6)
+                # Opção 1: Criar Usuário (USA O PADRÃO SALVO)
                 read -rp "Nome do usuário > " nick 
                 read -rp "Validade em dias [30] > " expiry_days; [ -z "$expiry_days" ] && expiry_days=30
                 
-                # Usa o protocolo e domínio PADRÃO salvos da Opção 6.
                 func_add_user "$nick" "$expiry_days" 
                 ;;
             2) read -rp "ID ou UUID para remover > " identifier; func_remove_user "$identifier" ;;
             3) func_list_users ;;
             5) 
-                # Opção 5: Gerar Certificado TLS (AGORA CHECA APONTAMENTO)
+                # Opção 5: Gerar Certificado
                 read -rp "Domínio FQDN (ex: vpn.seudominio.com) > " domain 
                 func_xray_cert "$domain"
                 ;;
             6) 
-                # Opção 6: Configurar Xray Core (NOVO FLUXO COM MENU NUMÉRICO E DOMÍNIO)
+                # Opção 6: Configurar Xray Core (FLUXO NOVO GARANTIDO)
                 
                 # 1. Porta
                 read -rp "Porta do inbound [443] > " p; [ -z "$p" ] && p=443
@@ -385,11 +380,11 @@ if [ -z "$1" ]; then
                     continue; 
                 fi
 
-                # 3. Protocolo (Menu Numérico) - CHAMA func_select_protocol()
+                # 3. Protocolo (Menu Numérico)
                 proto_result=$(func_select_protocol)
                 if [ "$proto_result" == "cancel" ] || [ "$proto_result" == "invalid" ]; then continue; fi
                 
-                # 4. Checagens Específicas para protocolos TLS (Vision/XHTTP)
+                # 4. Checagens Específicas
                 if [ "$proto_result" == "vision" ] || [ "$proto_result" == "xhttp" ]; then
                     if ! func_check_cert "$proto_result"; then 
                         read -rp "Pressione ENTER para retornar ao menu principal..."; 
