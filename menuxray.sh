@@ -1,7 +1,7 @@
 #!/bin/bash
 # menuxray.sh - Menu Interativo e Lógica Xray (Backend e Frontend)
 
-# --- Variáveis de Ambiente (Configure aqui se não usar o instalador) ---
+# --- Variáveis de Ambiente (Preenchidas pelo instalador) ---
 # O instalador irá substituir estas credenciais
 DB_HOST="{DB_HOST}"
 DB_NAME="{DB_NAME}"
@@ -16,7 +16,7 @@ XRAY_DIR="/opt/XrayTools"
 # Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
 
-# --- FUNÇÕES DE LÓGICA (Substitui o xray.php) ---
+# --- FUNÇÕES DE LÓGICA (DB e Xray) ---
 
 db_query() {
     psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
@@ -72,7 +72,7 @@ EOF
     {
       "tag": "inbound-dragoncore", "port": ($port | tonumber), "protocol": "vless",
       "settings": { "clients": [], "decryption": "none", "fallbacks": [] },
-      "streamSettings": $streamSettings
+      "streamSettings": $stream_settings
     }
   ],
   "outbounds": [{ "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "blocked" }],
@@ -100,15 +100,20 @@ func_add_user() {
     local uuid=$(uuidgen)
     local expiry=$(date -d "+30 days" +%F)
 
-    jq --arg uuid "$uuid" --arg email "$nick" \
-       '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $email, "level": 0}]' \
+    jq --arg uuid "$uuid" --arg nick_arg "$nick" \
+       '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick_arg, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol) VALUES ('$uuid', '$nick', '$expiry', '$protocol')"
     systemctl restart xray 2>/dev/null
 
-    local domain=$(hostname -I | awk '{print $1}')
-    [ -z "$domain" ] && domain="127.0.0.1"
+    local public_ip=$(curl -s icanhazip.com)
+    if [ -z "$public_ip" ]; then
+        local public_ip=$(hostname -I | awk '{print $1}')
+        echo "⚠️ Aviso: Falha ao obter IP público externo. Usando IP interno/local: $public_ip"
+    fi
+
+    local domain="${public_ip}" 
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null)
     
     echo "✅ Usuário criado: $nick"
@@ -170,6 +175,57 @@ func_purge_expired() {
     echo "✅ Purge concluído."
 }
 
+# --- FUNÇÃO DE DESINSTALAÇÃO GERAL ---
+
+func_uninstall_xray() {
+    echo "========================================="
+    echo "⚠️ DESINSTALAÇÃO COMPLETA DO XRAYX-TLS"
+    echo "========================================="
+    
+    read -rp "Confirma a desinstalação de Xray, arquivos e DB? (S/N): " confirm
+    if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
+        echo "❌ Desinstalação cancelada."
+        return
+    fi
+
+    # 1. Parar e remover o serviço Xray
+    echo "1. Removendo binário e serviço Xray Core..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove >/dev/null 2>&1
+    if [ $? -eq 0 ]; then echo "✅ Binário Xray removido."; else echo "⚠️ Aviso: Falha ao remover o binário Xray ou já estava ausente."; fi
+
+    # 2. Remover diretórios de configuração e dados
+    echo "2. Limpando diretórios de configuração..."
+    rm -rf /usr/local/etc/xray
+    rm -rf "$XRAY_DIR"
+    rm -rf "$SSL_DIR"
+    echo "✅ Diretórios (/usr/local/etc/xray, $XRAY_DIR, $SSL_DIR) removidos."
+
+    # 3. Remover o atalho do menu e o cronjob
+    echo "3. Removendo atalho e cronjob..."
+    rm -f /bin/xray-menu
+    
+    # Remove a linha do cronjob de limpeza
+    (crontab -l 2>/dev/null | grep -v "menuxray.sh func_purge_expired") | crontab -
+    echo "✅ Atalho e Cronjob removidos."
+
+    # 4. Remover a tabela 'xray' do PostgreSQL
+    read -rp "Deseja APAGAR a tabela 'xray' no DB '$DB_NAME'? (S/N): " confirm_db
+    if [[ "$confirm_db" =~ ^[Ss]$ ]]; then
+        echo "4. Removendo tabela do Banco de Dados..."
+        db_query "DROP TABLE IF EXISTS xray"
+        if [ $? -eq 0 ]; then echo "✅ Tabela 'xray' removida do DB."; else echo "❌ ERRO: Falha ao remover a tabela. Verifique manualmente o DB."; fi
+    else
+        echo "⚠️ Tabela do DB mantida (Você pode querer reusar o DB)."
+    fi
+
+    echo ""
+    echo "========================================="
+    echo "🎉 DESINSTALAÇÃO CONCLUÍDA!"
+    echo "========================================="
+    exit 0
+}
+
+
 # --- FUNÇÃO DE MENU XRAY (Interface do Usuário) ---
 menu_display() {
     clear
@@ -186,7 +242,8 @@ menu_display() {
     echo "6. Configurar Xray Core (Porta/Protocolo)"
     echo "8. Limpar Usuários Expirados (Purge)"
     
-    echo ""
+    echo "-----------------------------------------"
+    echo "9. **Desinstalar Xray e Scripts**"
     echo "0. Sair do Menu"
     echo "-----------------------------------------"
     read -rp "Digite sua opção: " choice
@@ -208,12 +265,12 @@ if [ -z "$1" ]; then
                 func_create_db_table; func_generate_config "$p" "$pr"
                 ;;
             8) func_purge_expired ;;
+            9) func_uninstall_xray ;; 
             0) echo "Saindo. Até logo!"; exit 0 ;;
             *) echo "Opção inválida. Tente novamente." ;;
         esac
-        if [ "$choice" != "0" ]; then read -rp "Pressione ENTER para voltar ao menu..."; fi
+        if [ "$choice" != "0" ] && [ "$choice" != "9" ]; then read -rp "Pressione ENTER para voltar ao menu..."; fi
     done
 else
-    # Permite chamar funções como CLI (usado pelo instalador e pelo cronjob)
     "$1" "${@:2}"
 fi
