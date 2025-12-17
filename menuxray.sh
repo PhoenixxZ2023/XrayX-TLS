@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Corrigida: Anti-Duplicidade e Textos Ajustados
+# menuxray.sh - Versão Final: Verificação Imediata de Usuário
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -136,17 +136,6 @@ func_add_user() {
     
     if [ -z "$nick" ]; then echo "❌ Erro: O nome de usuário não pode ser vazio."; return 1; fi
     if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Erro: Xray não configurado."; return 1; fi
-
-    # --- VERIFICAÇÃO DE DUPLICIDADE ---
-    local exists=$(db_query "SELECT id FROM xray WHERE nick = '$nick' LIMIT 1")
-    if [ -n "$exists" ]; then
-        echo "================================================="
-        echo "❌ ERRO: O usuário '$nick' JÁ EXISTE no sistema."
-        echo "   Por favor, tente novamente com outro nome."
-        echo "================================================="
-        return 1
-    fi
-    # ----------------------------------
 
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
@@ -292,11 +281,22 @@ if [ -z "$1" ]; then
         menu_display
         case "$choice" in
             1) 
-                # Lógica de input ajustada para os textos que você pediu
+                # 1. Pede o nome
                 read -rp "Nome de usuário: " n
+                if [ -z "$n" ]; then echo "❌ Nome inválido."; continue; fi
+
+                # 2. VERIFICAÇÃO IMEDIATA (Antes de pedir os dias)
+                check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
+                if [ -n "$check_exists" ]; then
+                    echo "========================================="
+                    echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
+                    echo "========================================="
+                    read -rp "Pressione ENTER para tentar outro nome..."
+                    continue # Volta para o início do menu, impedindo a criação
+                fi
+
+                # 3. Se não existe, pede os dias e prossegue
                 read -rp "Digite os dias: " d
-                
-                # Se o usuário não digitou dias, define padrão 30
                 [ -z "$d" ] && d=30
                 
                 func_add_user "$n" "$d" 
