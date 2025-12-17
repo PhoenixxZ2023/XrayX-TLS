@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final Consolidada (Permissões, JSON Blindado, Vision Completo, UX)
+# menuxray.sh - Versão Final: Loop de Tentativa de Usuário
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -96,7 +96,6 @@ func_check_domain_ip() {
     return 0
 }
 
-# --- FUNÇÃO ATUALIZADA (Corrige Permissões) ---
 func_xray_cert() {
     local domain="$1"
     if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
@@ -109,8 +108,6 @@ func_xray_cert() {
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
     
-    # CORREÇÃO DE PERMISSÃO (CRÍTICO)
-    # Permite que o usuário do sistema 'xray' leia os arquivos
     chmod 755 "$SSL_DIR"
     chmod 644 "$KEY_FILE"
     chmod 644 "$CRT_FILE"
@@ -123,24 +120,20 @@ func_xray_cert() {
     fi
 }
 
-# --- FUNÇÃO ATUALIZADA (JSON Seguro + Vision Completo) ---
 func_generate_config() {
     local port=${1:-443}
     local network=${2:-ws}
     local domain="$3"
     
-    # Validação de porta
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then port=443; fi
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
     
-    # Garante permissão na pasta de certificados antes de gerar a config
     if [ -d "$SSL_DIR" ]; then
         chmod 755 "$SSL_DIR"
         chmod 644 "$SSL_DIR"/* 2>/dev/null
     fi
 
-    # 1. Construir StreamSettings com JQ (Blindado + Vision Completo)
     local stream_settings=""
     
     if [ "$network" == "xhttp" ]; then
@@ -163,7 +156,6 @@ func_generate_config() {
                 grpcSettings: {serviceName: "gRPC"}
             }')
     elif [ "$network" == "vision" ]; then
-        # --- VISION COMPLETO (TCP + TLS + allowInsecure + tcpSettings) ---
         stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
             '{
                 network: "tcp", 
@@ -178,13 +170,10 @@ func_generate_config() {
                     header: {type: "none"}
                 }
             }')
-        # -----------------------------------------------------------------
     else 
-        # TCP Simples
         stream_settings=$(jq -n '{network: "tcp", security: "none"}')
     fi
 
-    # 2. Gerar JSON Principal
     jq -n --argjson stream "$stream_settings" --arg port "$port" \
       '{
           log: {loglevel: "warning"}, 
@@ -197,13 +186,11 @@ func_generate_config() {
           routing: {domainStrategy: "AsIs", rules: [{type: "field", inboundTag: ["api"], outboundTag: "api"}]}
       }' > "$CONFIG_PATH"
 
-    # 3. Adicionar Flow XTLS-Vision se necessário
     if [ "$network" == "vision" ]; then
         jq '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": "xtls-rprx-vision"}' \
            "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
 
-    # 4. Reiniciar e Validar
     systemctl restart xray
     sleep 2
     if systemctl is-active --quiet xray; then
@@ -357,25 +344,31 @@ if [ -z "$1" ]; then
         menu_display
         case "$choice" in
             1) 
-                # 1. Pede o nome
-                read -rp "Nome de usuário: " n
-                if [ -z "$n" ]; then echo "❌ Nome inválido."; continue; fi
+                # LOOP PARA CRIAR USUÁRIO (Não sai até digitar '0' ou criar com sucesso)
+                while true; do
+                    echo "-----------------------------------------"
+                    read -rp "Nome de usuário (ou 0 para voltar): " n
+                    
+                    if [ "$n" == "0" ] || [ -z "$n" ]; then break; fi
 
-                # 2. VERIFICAÇÃO IMEDIATA
-                check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
-                if [ -n "$check_exists" ]; then
-                    echo "========================================="
-                    echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
-                    echo "========================================="
-                    read -rp "Pressione ENTER para tentar outro nome..."
-                    continue 
-                fi
+                    # Verificação Imediata
+                    check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
+                    if [ -n "$check_exists" ]; then
+                        echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
+                        echo "   Tente outro nome."
+                        continue # Volta para pedir o nome, sem sair do submenu
+                    fi
 
-                # 3. Se não existe, pede os dias e prossegue
-                read -rp "Digite os dias: " d
-                [ -z "$d" ] && d=30
-                
-                func_add_user "$n" "$d" 
+                    # Se passou, pede os dias
+                    read -rp "Digite os dias: " d
+                    [ -z "$d" ] && d=30
+                    
+                    func_add_user "$n" "$d"
+                    
+                    # Sai do loop após criar (volta ao menu principal)
+                    # Se quiser criar vários seguidos, troque 'break' por 'continue' e tire o 'break' de cima
+                    break 
+                done
                 ;;
             2) read -rp "ID/UUID: " i; func_remove_user "$i" ;;
             3) func_list_users ;;
