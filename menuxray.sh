@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Menu Interativo e Lógica Xray (Versão Corrigida Output)
+# menuxray.sh - Menu Interativo e Lógica Xray (Versão Blindada JSON)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -36,10 +36,8 @@ func_create_db_table() {
 
 func_is_installed() { [ -f "$XRAY_BIN" ] || [ -f "/usr/bin/xray" ]; }
 
-# --- CORREÇÃO APLICADA AQUI: Redirecionamento de Saída >&2 ---
 func_select_protocol() {
-    # Todo o texto visual vai para stderr (&2) para aparecer na tela
-    # Apenas o echo final vai para stdout para ser capturado pela variável
+    # Redireciona menu para stderr para aparecer na tela
     {
         clear
         echo "========================================="
@@ -110,78 +108,26 @@ func_generate_config() {
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
     
-    # 1. Configurar StreamSettings
+    # 1. Configurar StreamSettings (Em linha única para evitar erro de indentação EOF)
     if [ "$network" == "xhttp" ]; then
-        stream_settings=$(cat <<EOF
-        {
-            "network": "xhttp", "security": "tls",
-            "tlsSettings": {
-                "serverName": "$domain",
-                "certificates": [{"certificateFile": "$CRT_FILE", "keyFile": "$KEY_FILE"}],
-                "alpn": ["h2", "http/1.1"]
-            },
-            "xhttpSettings": { "path": "/", "scMaxBufferedPosts": 30 }
-        }
-EOF
-        )
+        stream_settings="{\"network\": \"xhttp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$domain\", \"certificates\": [{\"certificateFile\": \"$CRT_FILE\", \"keyFile\": \"$KEY_FILE\"}], \"alpn\": [\"h2\", \"http/1.1\"]}, \"xhttpSettings\": {\"path\": \"/\", \"scMaxBufferedPosts\": 30}}"
     elif [ "$network" == "ws" ]; then
-        stream_settings=$(cat <<EOF
-        {
-            "network": "ws", "security": "none",
-            "wsSettings": { "acceptProxyProtocol": false, "path": "/" }
-        }
-EOF
-        )
+        stream_settings="{\"network\": \"ws\", \"security\": \"none\", \"wsSettings\": {\"acceptProxyProtocol\": false, \"path\": \"/\"}}"
     elif [ "$network" == "grpc" ]; then
-        stream_settings=$(cat <<EOF
-        {
-            "network": "grpc", "security": "none",
-            "grpcSettings": { "serviceName": "gRPC" }
-        }
-EOF
-        )
+        stream_settings="{\"network\": \"grpc\", \"security\": \"none\", \"grpcSettings\": {\"serviceName\": \"gRPC\"}}"
     elif [ "$network" == "vision" ]; then
-        stream_settings=$(cat <<EOF
-        {
-            "network": "tcp", "security": "tls",
-            "tlsSettings": {
-                "serverName": "$domain",
-                "certificates": [{"certificateFile": "$CRT_FILE", "keyFile": "$KEY_FILE"}],
-                "minVersion": "1.2"
-            }
-        }
-EOF
-        )
+        stream_settings="{\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$domain\", \"certificates\": [{\"certificateFile\": \"$CRT_FILE\", \"keyFile\": \"$KEY_FILE\"}], \"minVersion\": \"1.2\"}}"
         flow_setting="xtls-rprx-vision"
     else 
         stream_settings='{ "network": "tcp", "security": "none" }'
     fi
 
-    # 2. Gerar Config JSON via JQ
-    jq -n \
-      --argjson streamSettings "$stream_settings" \
-      --arg port "$port" \
-      '{
-      "api": { "services": [ "HandlerService", "LoggerService", "StatsService" ], "tag": "api" },
-      "inbounds": [
-        { "tag": "api", "port": 1080, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "listen": "127.0.0.1" },
-        {
-          "tag": "inbound-dragoncore",
-          "port": ($port | tonumber),
-          "protocol": "vless",
-          "settings": { "clients": [], "decryption": "none", "fallbacks": [] },
-          "streamSettings": $stream_settings
-        }
-      ],
-      "outbounds": [{ "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "blocked" }],
-      "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["api"], "outboundTag": "api" } ] }
-    }' > "$CONFIG_PATH"
+    # 2. Gerar Config JSON via JQ (Comando em linha única para evitar quebra)
+    jq -n --argjson streamSettings "$stream_settings" --arg port "$port" '{ "api": { "services": [ "HandlerService", "LoggerService", "StatsService" ], "tag": "api" }, "inbounds": [ { "tag": "api", "port": 1080, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "listen": "127.0.0.1" }, { "tag": "inbound-dragoncore", "port": ($port | tonumber), "protocol": "vless", "settings": { "clients": [], "decryption": "none", "fallbacks": [] }, "streamSettings": $streamSettings } ], "outbounds": [{ "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "blocked" }], "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["api"], "outboundTag": "api" } ] } }' > "$CONFIG_PATH"
 
     # Inserir flow (apenas para Vision)
     if [ -n "$flow_setting" ]; then
-        jq --arg flow "$flow_setting" \
-           '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": $flow}' \
-           "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+        jq --arg flow "$flow_setting" '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": $flow}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
 
     systemctl restart xray 2>/dev/null
@@ -314,15 +260,13 @@ if [ -z "$1" ]; then
             5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
             6) 
                 res=$(func_select_protocol)
-                # Adicionei esta linha para depuração caso precise, mas agora deve funcionar:
                 if [ "$res" == "invalid" ]; then
-                    echo "❌ Opção inválida selecionada."
-                    read -rp "Enter para continuar..."
+                    echo "❌ Opção inválida."
+                    read -rp "Enter..."
                 elif [ "$res" != "cancel" ]; then
                     read -rp "Porta [443]: " p; [ -z "$p" ] && p=443
                     read -rp "Domínio/IP: " d
                     
-                    # Verificação para protocolos seguros
                     if [ "$res" == "vision" ] || [ "$res" == "xhttp" ]; then
                          if func_check_cert && func_check_domain_ip "$d"; then
                              func_generate_config "$p" "$res" "$d"
