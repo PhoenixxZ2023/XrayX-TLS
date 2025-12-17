@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final: Verificação Imediata de Usuário
+# menuxray.sh - Versão Final Consolidada (Permissões, JSON Blindado, Vision Completo, UX)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -96,38 +96,125 @@ func_check_domain_ip() {
     return 0
 }
 
+# --- FUNÇÃO ATUALIZADA (Corrige Permissões) ---
+func_xray_cert() {
+    local domain="$1"
+    if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
+    if ! func_check_domain_ip "$domain"; then return 1; fi
+    
+    mkdir -p "$SSL_DIR"
+    
+    echo "Gerando certificado autoassinado para $domain..."
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
+        -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
+    
+    # CORREÇÃO DE PERMISSÃO (CRÍTICO)
+    # Permite que o usuário do sistema 'xray' leia os arquivos
+    chmod 755 "$SSL_DIR"
+    chmod 644 "$KEY_FILE"
+    chmod 644 "$CRT_FILE"
+
+    if [ -f "$KEY_FILE" ]; then
+        echo "✅ Certificado gerado e permissões ajustadas."
+    else
+        echo "❌ Falha ao gerar certificado."
+        return 1
+    fi
+}
+
+# --- FUNÇÃO ATUALIZADA (JSON Seguro + Vision Completo) ---
 func_generate_config() {
     local port=${1:-443}
     local network=${2:-ws}
     local domain="$3"
-    local stream_settings=""
-    local flow_setting=""
-
+    
+    # Validação de porta
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -le 0 ] || [ "$port" -gt 65535 ]; then port=443; fi
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
     
+    # Garante permissão na pasta de certificados antes de gerar a config
+    if [ -d "$SSL_DIR" ]; then
+        chmod 755 "$SSL_DIR"
+        chmod 644 "$SSL_DIR"/* 2>/dev/null
+    fi
+
+    # 1. Construir StreamSettings com JQ (Blindado + Vision Completo)
+    local stream_settings=""
+    
     if [ "$network" == "xhttp" ]; then
-        stream_settings="{\"network\": \"xhttp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$domain\", \"certificates\": [{\"certificateFile\": \"$CRT_FILE\", \"keyFile\": \"$KEY_FILE\"}], \"alpn\": [\"h2\", \"http/1.1\"]}, \"xhttpSettings\": {\"path\": \"/\", \"scMaxBufferedPosts\": 30}}"
+        stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
+            '{
+                network: "xhttp", security: "tls",
+                tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], alpn: ["h2", "http/1.1"]},
+                xhttpSettings: {path: "/", scMaxBufferedPosts: 30}
+            }')
     elif [ "$network" == "ws" ]; then
-        stream_settings="{\"network\": \"ws\", \"security\": \"none\", \"wsSettings\": {\"acceptProxyProtocol\": false, \"path\": \"/\"}}"
+        stream_settings=$(jq -n \
+            '{
+                network: "ws", security: "none",
+                wsSettings: {acceptProxyProtocol: false, path: "/"}
+            }')
     elif [ "$network" == "grpc" ]; then
-        stream_settings="{\"network\": \"grpc\", \"security\": \"none\", \"grpcSettings\": {\"serviceName\": \"gRPC\"}}"
+        stream_settings=$(jq -n \
+            '{
+                network: "grpc", security: "none",
+                grpcSettings: {serviceName: "gRPC"}
+            }')
     elif [ "$network" == "vision" ]; then
-        stream_settings="{\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$domain\", \"certificates\": [{\"certificateFile\": \"$CRT_FILE\", \"keyFile\": \"$KEY_FILE\"}], \"minVersion\": \"1.2\"}}"
-        flow_setting="xtls-rprx-vision"
+        # --- VISION COMPLETO (TCP + TLS + allowInsecure + tcpSettings) ---
+        stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
+            '{
+                network: "tcp", 
+                security: "tls",
+                tlsSettings: {
+                    serverName: $dom, 
+                    certificates: [{certificateFile: $crt, keyFile: $key}], 
+                    minVersion: "1.2", 
+                    allowInsecure: true
+                },
+                tcpSettings: {
+                    header: {type: "none"}
+                }
+            }')
+        # -----------------------------------------------------------------
     else 
-        stream_settings='{ "network": "tcp", "security": "none" }'
+        # TCP Simples
+        stream_settings=$(jq -n '{network: "tcp", security: "none"}')
     fi
 
-    jq -n --argjson streamSettings "$stream_settings" --arg port "$port" '{ "api": { "services": [ "HandlerService", "LoggerService", "StatsService" ], "tag": "api" }, "inbounds": [ { "tag": "api", "port": 1080, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "listen": "127.0.0.1" }, { "tag": "inbound-dragoncore", "port": ($port | tonumber), "protocol": "vless", "settings": { "clients": [], "decryption": "none", "fallbacks": [] }, "streamSettings": $streamSettings } ], "outbounds": [{ "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "blocked" }], "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["api"], "outboundTag": "api" } ] } }' > "$CONFIG_PATH"
+    # 2. Gerar JSON Principal
+    jq -n --argjson stream "$stream_settings" --arg port "$port" \
+      '{
+          log: {loglevel: "warning"}, 
+          api: {services: ["HandlerService", "LoggerService", "StatsService"], tag: "api"}, 
+          inbounds: [
+            {tag: "api", port: 1080, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, listen: "127.0.0.1"}, 
+            {tag: "inbound-dragoncore", port: ($port | tonumber), protocol: "vless", settings: {clients: [], decryption: "none", fallbacks: []}, streamSettings: $stream}
+          ], 
+          outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "blocked"}], 
+          routing: {domainStrategy: "AsIs", rules: [{type: "field", inboundTag: ["api"], outboundTag: "api"}]}
+      }' > "$CONFIG_PATH"
 
-    if [ -n "$flow_setting" ]; then
-        jq --arg flow "$flow_setting" '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": $flow}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    # 3. Adicionar Flow XTLS-Vision se necessário
+    if [ "$network" == "vision" ]; then
+        jq '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": "xtls-rprx-vision"}' \
+           "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
 
-    systemctl restart xray 2>/dev/null
-    echo "✅ Config Xray atualizada (Porta: $port | Proto: $network | Domain: $domain)"
+    # 4. Reiniciar e Validar
+    systemctl restart xray
+    sleep 2
+    if systemctl is-active --quiet xray; then
+        echo "✅ Config Xray aplicada com sucesso!"
+        echo "   - Protocolo: $network"
+        echo "   - Porta: $port"
+        echo "   - Domínio: $domain"
+    else
+        echo "❌ ERRO: Xray falhou ao iniciar. Verifique permissões ou log."
+        journalctl -u xray -n 10 --no-pager
+    fi
 }
 
 func_add_user() {
@@ -204,17 +291,6 @@ func_list_users() {
     echo "----------------"
 }
 
-func_xray_cert() {
-    local domain="$1"
-    if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
-    if ! func_check_domain_ip "$domain"; then return 1; fi
-    mkdir -p "$SSL_DIR"
-    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-        -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
-        -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
-    echo "✅ Certificado gerado para $domain"
-}
-
 func_purge_expired() {
     local today=$(date +%F)
     local expired_uuids=$(db_query "SELECT uuid FROM xray WHERE expiry < '$today'")
@@ -285,14 +361,14 @@ if [ -z "$1" ]; then
                 read -rp "Nome de usuário: " n
                 if [ -z "$n" ]; then echo "❌ Nome inválido."; continue; fi
 
-                # 2. VERIFICAÇÃO IMEDIATA (Antes de pedir os dias)
+                # 2. VERIFICAÇÃO IMEDIATA
                 check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
                 if [ -n "$check_exists" ]; then
                     echo "========================================="
                     echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
                     echo "========================================="
                     read -rp "Pressione ENTER para tentar outro nome..."
-                    continue # Volta para o início do menu, impedindo a criação
+                    continue 
                 fi
 
                 # 3. Se não existe, pede os dias e prossegue
