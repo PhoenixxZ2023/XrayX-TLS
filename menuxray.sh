@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Menu Interativo e Lógica Xray (Versão Uninstaller Completo)
+# menuxray.sh - Versão Corrigida: Anti-Duplicidade e Textos Ajustados
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -134,8 +134,19 @@ func_add_user() {
     local nick="$1"
     local expiry_days=${2:-30} 
     
-    if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return 1; fi
-    if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Xray não configurado."; return 1; fi
+    if [ -z "$nick" ]; then echo "❌ Erro: O nome de usuário não pode ser vazio."; return 1; fi
+    if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Erro: Xray não configurado."; return 1; fi
+
+    # --- VERIFICAÇÃO DE DUPLICIDADE ---
+    local exists=$(db_query "SELECT id FROM xray WHERE nick = '$nick' LIMIT 1")
+    if [ -n "$exists" ]; then
+        echo "================================================="
+        echo "❌ ERRO: O usuário '$nick' JÁ EXISTE no sistema."
+        echo "   Por favor, tente novamente com outro nome."
+        echo "================================================="
+        return 1
+    fi
+    # ----------------------------------
 
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
@@ -157,7 +168,7 @@ func_add_user() {
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
     systemctl restart xray 2>/dev/null
     
-    echo "✅ Usuário criado: $nick ($expiry)"
+    echo "✅ Usuário criado: $nick (Expira: $expiry)"
     echo "UUID: $uuid"
     
     local link=""
@@ -251,11 +262,9 @@ func_uninstall_xray() {
     rm -rf "$XRAY_DIR"
     rm -rf "$SSL_DIR"
     rm -f /bin/xray-menu
-    # Remove cronjob específico
     (crontab -l | grep -v "func_purge_expired") | crontab -
 
     echo "4. Removendo Banco de Dados..."
-    # Usa o usuário postgres do sistema para remover o DB criado pelo script
     sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
     sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" >/dev/null 2>&1
     
@@ -282,7 +291,16 @@ if [ -z "$1" ]; then
     while true; do
         menu_display
         case "$choice" in
-            1) read -rp "Nick: " n; read -rp "Dias: " d; func_add_user "$n" "$d" ;;
+            1) 
+                # Lógica de input ajustada para os textos que você pediu
+                read -rp "Nome de usuário: " n
+                read -rp "Digite os dias: " d
+                
+                # Se o usuário não digitou dias, define padrão 30
+                [ -z "$d" ] && d=30
+                
+                func_add_user "$n" "$d" 
+                ;;
             2) read -rp "ID/UUID: " i; func_remove_user "$i" ;;
             3) func_list_users ;;
             5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
