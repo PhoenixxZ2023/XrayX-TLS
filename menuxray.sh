@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final: Loop de Tentativa de Usuário
+# menuxray.sh - Versão Final (Links Turbinados + Correções Totais)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -108,6 +108,7 @@ func_xray_cert() {
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
     
+    # CORREÇÃO DE PERMISSÃO
     chmod 755 "$SSL_DIR"
     chmod 644 "$KEY_FILE"
     chmod 644 "$CRT_FILE"
@@ -234,26 +235,29 @@ func_add_user() {
     echo "✅ Usuário criado: $nick (Expira: $expiry)"
     echo "UUID: $uuid"
     
+    # --- GERADOR DE LINK TURBINADO (Para V2RayNG/Custom) ---
     local link=""
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
-        link="vless://${uuid}@${domain}:${port}?type=grpc&serviceName=${serviceName}&security=${sec}#${nick}"
+        link="vless://${uuid}@${domain}:${port}?type=grpc&serviceName=${serviceName}&security=${sec}&encryption=none&sni=${domain}#${nick}"
     elif [ "$net" == "ws" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path' "$CONFIG_PATH")
-        link="vless://${uuid}@${domain}:${port}?type=ws&path=${path}&security=${sec}#${nick}"
+        link="vless://${uuid}@${domain}:${port}?type=ws&path=${path}&security=${sec}&encryption=none&host=${domain}&sni=${domain}#${nick}"
     elif [ "$net" == "xhttp" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path' "$CONFIG_PATH")
-        link="vless://${uuid}@${domain}:${port}?type=xhttp&path=${path}&security=tls#${nick}"
+        link="vless://${uuid}@${domain}:${port}?type=xhttp&path=${path}&security=tls&encryption=none&host=${domain}&sni=${domain}&mode=auto#${nick}"
     elif [ "$net" == "tcp" ] && [ "$sec" == "tls" ]; then
         local flow=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").settings.flow // empty' "$CONFIG_PATH")
         if [ "$flow" == "xtls-rprx-vision" ]; then
-            link="vless://${uuid}@${domain}:${port}?security=tls&flow=xtls-rprx-vision&encryption=none#${nick}"
+            link="vless://${uuid}@${domain}:${port}?security=tls&flow=xtls-rprx-vision&encryption=none&sni=${domain}#${nick}"
         else
-            link="vless://${uuid}@${domain}:${port}?security=tls#${nick}"
+            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&sni=${domain}#${nick}"
         fi
     else 
-        link="vless://${uuid}@${domain}:${port}?security=none#${nick}"
+        # TCP Simples
+        link="vless://${uuid}@${domain}:${port}?security=none&encryption=none#${nick}"
     fi
+    
     echo "------------------------------------------------"
     echo "$link"
     echo "------------------------------------------------"
@@ -344,29 +348,23 @@ if [ -z "$1" ]; then
         menu_display
         case "$choice" in
             1) 
-                # LOOP PARA CRIAR USUÁRIO (Não sai até digitar '0' ou criar com sucesso)
                 while true; do
                     echo "-----------------------------------------"
                     read -rp "Nome de usuário (ou 0 para voltar): " n
                     
                     if [ "$n" == "0" ] || [ -z "$n" ]; then break; fi
 
-                    # Verificação Imediata
                     check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
                     if [ -n "$check_exists" ]; then
                         echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
                         echo "   Tente outro nome."
-                        continue # Volta para pedir o nome, sem sair do submenu
+                        continue 
                     fi
 
-                    # Se passou, pede os dias
                     read -rp "Digite os dias: " d
                     [ -z "$d" ] && d=30
                     
                     func_add_user "$n" "$d"
-                    
-                    # Sai do loop após criar (volta ao menu principal)
-                    # Se quiser criar vários seguidos, troque 'break' por 'continue' e tire o 'break' de cima
                     break 
                 done
                 ;;
