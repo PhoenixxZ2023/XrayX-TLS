@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final (Links Turbinados + Correções Totais)
+# menuxray.sh - Versão: Instalação Oficial na Opção 6 (Protocolo -> Porta -> Install)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -34,7 +34,22 @@ func_create_db_table() {
     if [ $? -eq 0 ]; then echo "✅ Tabela verificada/criada."; else echo "❌ ERRO: Falha ao acessar o DB."; fi
 }
 
-func_is_installed() { [ -f "$XRAY_BIN" ] || [ -f "/usr/bin/xray" ]; }
+# Função para INSTALAR o Xray do Repositório Oficial
+func_install_official_core() {
+    echo "========================================="
+    echo "📥 Instalando/Atualizando Xray Core (Oficial)"
+    echo "========================================="
+    
+    # Comando oficial do repositório XTLS
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    
+    if [ $? -eq 0 ]; then
+        echo "✅ Xray Core instalado com sucesso!"
+    else
+        echo "❌ Falha ao baixar/instalar Xray Core."
+        read -rp "Pressione ENTER para continuar mesmo assim..."
+    fi
+}
 
 func_select_protocol() {
     {
@@ -108,7 +123,6 @@ func_xray_cert() {
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
     
-    # CORREÇÃO DE PERMISSÃO
     chmod 755 "$SSL_DIR"
     chmod 644 "$KEY_FILE"
     chmod 644 "$CRT_FILE"
@@ -235,7 +249,7 @@ func_add_user() {
     echo "✅ Usuário criado: $nick (Expira: $expiry)"
     echo "UUID: $uuid"
     
-    # --- GERADOR DE LINK TURBINADO (Para V2RayNG/Custom) ---
+    # --- GERADOR DE LINK TURBINADO ---
     local link=""
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
@@ -254,10 +268,8 @@ func_add_user() {
             link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&sni=${domain}#${nick}"
         fi
     else 
-        # TCP Simples
         link="vless://${uuid}@${domain}:${port}?security=none&encryption=none#${nick}"
     fi
-    
     echo "------------------------------------------------"
     echo "$link"
     echo "------------------------------------------------"
@@ -336,7 +348,7 @@ menu_display() {
     echo "2. Remover Usuário"
     echo "3. Listar Usuários"
     echo "5. Gerar Certificado TLS"
-    echo "6. Configurar Xray (Porta/Proto)"
+    echo "6. Instalar e Configurar Xray Core"
     echo "8. Limpar Expirados"
     echo "9. Desinstalar (Completo)"
     echo "0. Sair"
@@ -351,19 +363,14 @@ if [ -z "$1" ]; then
                 while true; do
                     echo "-----------------------------------------"
                     read -rp "Nome de usuário (ou 0 para voltar): " n
-                    
                     if [ "$n" == "0" ] || [ -z "$n" ]; then break; fi
-
                     check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
                     if [ -n "$check_exists" ]; then
                         echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
-                        echo "   Tente outro nome."
                         continue 
                     fi
-
                     read -rp "Digite os dias: " d
                     [ -z "$d" ] && d=30
-                    
                     func_add_user "$n" "$d"
                     break 
                 done
@@ -372,6 +379,7 @@ if [ -z "$1" ]; then
             3) func_list_users ;;
             5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
             6) 
+                # --- FLUXO DA OPÇÃO 6 ATUALIZADO ---
                 res=$(func_select_protocol)
                 if [ "$res" == "invalid" ]; then
                     echo "❌ Opção inválida."
@@ -379,6 +387,13 @@ if [ -z "$1" ]; then
                 elif [ "$res" != "cancel" ]; then
                     read -rp "Porta [443]: " p; [ -z "$p" ] && p=443
                     read -rp "Domínio/IP: " d
+                    
+                    # PERGUNTA SE QUER INSTALAR O CORE AGORA
+                    echo "-----------------------------------------"
+                    read -rp "Deseja baixar/atualizar o binário Xray Oficial agora? (s/n): " install_now
+                    if [[ "$install_now" =~ ^[Ss]$ ]]; then
+                        func_install_official_core
+                    fi
                     
                     if [ "$res" == "vision" ] || [ "$res" == "xhttp" ]; then
                          if func_check_cert && func_check_domain_ip "$d"; then
