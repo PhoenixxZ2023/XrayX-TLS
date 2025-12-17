@@ -1,7 +1,7 @@
 #!/bin/bash
-# menuxray.sh - Menu Interativo e Lógica Xray (Versão GitHub)
+# menuxray.sh - Menu Interativo e Lógica Xray (Versão Corrigida Output)
 
-# --- Variáveis de Ambiente (Preenchidas pelo instalador via SED) ---
+# --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
 DB_NAME="{DB_NAME}"
 DB_USER="{DB_USER}"
@@ -22,7 +22,7 @@ export PGPASSWORD=$DB_PASS
 mkdir -p "$XRAY_DIR"
 mkdir -p "$SSL_DIR"
 
-# --- FUNÇÕES DE LÓGICA (DB e Xray) ---
+# --- FUNÇÕES DE LÓGICA ---
 
 db_query() {
     psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
@@ -36,20 +36,25 @@ func_create_db_table() {
 
 func_is_installed() { [ -f "$XRAY_BIN" ] || [ -f "/usr/bin/xray" ]; }
 
-# FUNÇÃO PARA SELECIONAR PROTOCOLO
+# --- CORREÇÃO APLICADA AQUI: Redirecionamento de Saída >&2 ---
 func_select_protocol() {
-    clear
-    echo "========================================="
-    echo "⚙️  Seleção de Protocolo de Transporte"
-    echo "========================================="
-    echo "1. ws (WebSocket) - Compatível com CDNs (Cloudflare)"
-    echo "2. grpc (gRPC) - ✅ Alta Performance"
-    echo "3. xhttp (Novo HTTP/2) - Baixa Latência"
-    echo "4. tcp (TCP Simples) - Apenas para testes/fallback"
-    echo "5. vision (XTLS-Vision) - 🚀 Performance Máxima (Requer Porta 443 + Cert)"
-    echo "0. Cancelar"
-    echo "-----------------------------------------"
-    read -rp "Opção: " choice
+    # Todo o texto visual vai para stderr (&2) para aparecer na tela
+    # Apenas o echo final vai para stdout para ser capturado pela variável
+    {
+        clear
+        echo "========================================="
+        echo "⚙️  Seleção de Protocolo de Transporte"
+        echo "========================================="
+        echo "1. ws (WebSocket) - Compatível com CDNs (Cloudflare)"
+        echo "2. grpc (gRPC) - ✅ Alta Performance"
+        echo "3. xhttp (Novo HTTP/2) - Baixa Latência"
+        echo "4. tcp (TCP Simples) - Apenas para testes/fallback"
+        echo "5. vision (XTLS-Vision) - 🚀 Performance Máxima (Requer Porta 443 + Cert)"
+        echo "0. Cancelar"
+        echo "-----------------------------------------"
+    } >&2
+    
+    read -rp "Digite o número da opção: " choice
     
     case "$choice" in
         1) echo "ws" ;;
@@ -86,7 +91,7 @@ func_check_domain_ip() {
     
     if [ "$domain_ip" != "$vps_ip" ]; then
         echo "⚠️  AVISO: O IP do domínio ($domain_ip) é diferente do IP desta VPS ($vps_ip)."
-        echo "Isso pode ser normal se usar Cloudflare Proxy (Laranjinha), mas impede TCP/Vision direto."
+        echo "Isso pode ser normal se usar Cloudflare Proxy, mas impede TCP/Vision direto."
         read -rp "Deseja continuar? (s/n): " confirm
         [[ "$confirm" != "s" ]] && return 1
     fi
@@ -109,8 +114,7 @@ func_generate_config() {
     if [ "$network" == "xhttp" ]; then
         stream_settings=$(cat <<EOF
         {
-            "network": "xhttp",
-            "security": "tls",
+            "network": "xhttp", "security": "tls",
             "tlsSettings": {
                 "serverName": "$domain",
                 "certificates": [{"certificateFile": "$CRT_FILE", "keyFile": "$KEY_FILE"}],
@@ -123,8 +127,7 @@ EOF
     elif [ "$network" == "ws" ]; then
         stream_settings=$(cat <<EOF
         {
-            "network": "ws",
-            "security": "none",
+            "network": "ws", "security": "none",
             "wsSettings": { "acceptProxyProtocol": false, "path": "/" }
         }
 EOF
@@ -132,8 +135,7 @@ EOF
     elif [ "$network" == "grpc" ]; then
         stream_settings=$(cat <<EOF
         {
-            "network": "grpc",
-            "security": "none",
+            "network": "grpc", "security": "none",
             "grpcSettings": { "serviceName": "gRPC" }
         }
 EOF
@@ -141,8 +143,7 @@ EOF
     elif [ "$network" == "vision" ]; then
         stream_settings=$(cat <<EOF
         {
-            "network": "tcp",
-            "security": "tls",
+            "network": "tcp", "security": "tls",
             "tlsSettings": {
                 "serverName": "$domain",
                 "certificates": [{"certificateFile": "$CRT_FILE", "keyFile": "$KEY_FILE"}],
@@ -194,7 +195,6 @@ func_add_user() {
     if [ -z "$nick" ]; then echo "Erro: Nick necessário."; return 1; fi
     if [ ! -f "$CONFIG_PATH" ]; then echo "Erro: Xray não configurado."; return 1; fi
 
-    # LÊ CONFIGURAÇÃO REAL DO JSON (Correção do Bug)
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
     local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
@@ -218,7 +218,6 @@ func_add_user() {
     echo "✅ Usuário criado: $nick ($expiry)"
     echo "UUID: $uuid"
     
-    # GERADOR DE LINK (VLESS)
     local link=""
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
@@ -315,11 +314,19 @@ if [ -z "$1" ]; then
             5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
             6) 
                 res=$(func_select_protocol)
-                if [ "$res" != "cancel" ] && [ "$res" != "invalid" ]; then
+                # Adicionei esta linha para depuração caso precise, mas agora deve funcionar:
+                if [ "$res" == "invalid" ]; then
+                    echo "❌ Opção inválida selecionada."
+                    read -rp "Enter para continuar..."
+                elif [ "$res" != "cancel" ]; then
                     read -rp "Porta [443]: " p; [ -z "$p" ] && p=443
                     read -rp "Domínio/IP: " d
+                    
+                    # Verificação para protocolos seguros
                     if [ "$res" == "vision" ] || [ "$res" == "xhttp" ]; then
-                         func_check_cert && func_check_domain_ip "$d" && func_generate_config "$p" "$res" "$d"
+                         if func_check_cert && func_check_domain_ip "$d"; then
+                             func_generate_config "$p" "$res" "$d"
+                         fi
                     else
                          func_generate_config "$p" "$res" "$d"
                     fi
@@ -330,7 +337,7 @@ if [ -z "$1" ]; then
             9) func_uninstall_xray ;; 
             0) exit 0 ;;
         esac
-        [ "$choice" != "0" ] && read -rp "Enter..."
+        [ "$choice" != "0" ] && read -rp "Enter para voltar..."
     done
 else
     "$1" "${@:2}"
