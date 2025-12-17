@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Menu Interativo e Lógica Xray (Versão Blindada JSON)
+# menuxray.sh - Menu Interativo e Lógica Xray (Versão Uninstaller Completo)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -37,7 +37,6 @@ func_create_db_table() {
 func_is_installed() { [ -f "$XRAY_BIN" ] || [ -f "/usr/bin/xray" ]; }
 
 func_select_protocol() {
-    # Redireciona menu para stderr para aparecer na tela
     {
         clear
         echo "========================================="
@@ -108,7 +107,6 @@ func_generate_config() {
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
     
-    # 1. Configurar StreamSettings (Em linha única para evitar erro de indentação EOF)
     if [ "$network" == "xhttp" ]; then
         stream_settings="{\"network\": \"xhttp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"$domain\", \"certificates\": [{\"certificateFile\": \"$CRT_FILE\", \"keyFile\": \"$KEY_FILE\"}], \"alpn\": [\"h2\", \"http/1.1\"]}, \"xhttpSettings\": {\"path\": \"/\", \"scMaxBufferedPosts\": 30}}"
     elif [ "$network" == "ws" ]; then
@@ -122,10 +120,8 @@ func_generate_config() {
         stream_settings='{ "network": "tcp", "security": "none" }'
     fi
 
-    # 2. Gerar Config JSON via JQ (Comando em linha única para evitar quebra)
     jq -n --argjson streamSettings "$stream_settings" --arg port "$port" '{ "api": { "services": [ "HandlerService", "LoggerService", "StatsService" ], "tag": "api" }, "inbounds": [ { "tag": "api", "port": 1080, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "listen": "127.0.0.1" }, { "tag": "inbound-dragoncore", "port": ($port | tonumber), "protocol": "vless", "settings": { "clients": [], "decryption": "none", "fallbacks": [] }, "streamSettings": $streamSettings } ], "outbounds": [{ "protocol": "freedom", "tag": "direct" }, { "protocol": "blackhole", "tag": "blocked" }], "routing": { "domainStrategy": "AsIs", "rules": [ { "type": "field", "inboundTag": ["api"], "outboundTag": "api" } ] } }' > "$CONFIG_PATH"
 
-    # Inserir flow (apenas para Vision)
     if [ -n "$flow_setting" ]; then
         jq --arg flow "$flow_setting" '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": $flow}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
@@ -226,12 +222,44 @@ func_purge_expired() {
 }
 
 func_uninstall_xray() {
-    systemctl stop xray; systemctl disable xray
+    echo "========================================="
+    echo "⚠️  DESINSTALAÇÃO COMPLETA (Deep Clean)"
+    echo "========================================="
+    echo "Isso removerá:"
+    echo " - Serviço Xray e binários"
+    echo " - Todas as configurações e certificados"
+    echo " - Banco de Dados '$DB_NAME' e Usuário '$DB_USER'"
+    echo " - Cronjobs e atalhos"
+    echo "-----------------------------------------"
+    read -rp "Digite 'SIM' para confirmar: " confirm
+    
+    if [ "$confirm" != "SIM" ]; then echo "❌ Cancelado."; return; fi
+
+    echo "1. Parando serviços..."
+    systemctl stop xray 2>/dev/null
+    systemctl disable xray 2>/dev/null
+    
+    echo "2. Removendo Xray Core..."
     rm -f /usr/local/bin/xray
-    rm -rf /usr/local/etc/xray "$XRAY_DIR" "$SSL_DIR"
+    rm -rf /usr/local/etc/xray
+    rm -rf /usr/local/share/xray
+    rm -f /etc/systemd/system/xray.service
+    rm -f /etc/systemd/system/xray@.service
+    systemctl daemon-reload
+
+    echo "3. Limpando Script..."
+    rm -rf "$XRAY_DIR"
+    rm -rf "$SSL_DIR"
     rm -f /bin/xray-menu
-    db_query "DROP TABLE IF EXISTS xray"
-    echo "✅ Desinstalado."
+    # Remove cronjob específico
+    (crontab -l | grep -v "func_purge_expired") | crontab -
+
+    echo "4. Removendo Banco de Dados..."
+    # Usa o usuário postgres do sistema para remover o DB criado pelo script
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
+    sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" >/dev/null 2>&1
+    
+    echo "✅ Desinstalação Completa! O sistema está limpo."
     exit 0
 }
 
@@ -245,7 +273,7 @@ menu_display() {
     echo "5. Gerar Certificado TLS"
     echo "6. Configurar Xray (Porta/Proto)"
     echo "8. Limpar Expirados"
-    echo "9. Desinstalar"
+    echo "9. Desinstalar (Completo)"
     echo "0. Sair"
     read -rp "Opção: " choice
 }
