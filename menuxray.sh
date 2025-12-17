@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão: Instalação Oficial na Opção 6 (Protocolo -> Porta -> Install)
+# menuxray.sh - Versão: Suporte Automático a Bug Host/SNI
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -14,6 +14,7 @@ KEY_FILE="$SSL_DIR/privkey.pem"
 CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
+BUG_HOST_FILE="$XRAY_DIR/bughost" 
 
 # Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
@@ -34,15 +35,11 @@ func_create_db_table() {
     if [ $? -eq 0 ]; then echo "✅ Tabela verificada/criada."; else echo "❌ ERRO: Falha ao acessar o DB."; fi
 }
 
-# Função para INSTALAR o Xray do Repositório Oficial
 func_install_official_core() {
     echo "========================================="
     echo "📥 Instalando/Atualizando Xray Core (Oficial)"
     echo "========================================="
-    
-    # Comando oficial do repositório XTLS
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    
     if [ $? -eq 0 ]; then
         echo "✅ Xray Core instalado com sucesso!"
     else
@@ -101,9 +98,10 @@ func_check_domain_ip() {
         return 1
     fi
     
+    # Se o IP for diferente, avisa mas permite (pode ser Cloudflare ou Bug Host intencional)
     if [ "$domain_ip" != "$vps_ip" ]; then
         echo "⚠️  AVISO: O IP do domínio ($domain_ip) é diferente do IP desta VPS ($vps_ip)."
-        echo "Isso pode ser normal se usar Cloudflare Proxy, mas impede TCP/Vision direto."
+        echo "Isso pode ser normal se usar Cloudflare Proxy."
         read -rp "Deseja continuar? (s/n): " confirm
         [[ "$confirm" != "s" ]] && return 1
     fi
@@ -123,9 +121,9 @@ func_xray_cert() {
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
     
-    chmod 777 "$SSL_DIR"
-    chmod 777 "$KEY_FILE"
-    chmod 777 "$CRT_FILE"
+    chmod 755 "$SSL_DIR"
+    chmod 644 "$KEY_FILE"
+    chmod 644 "$CRT_FILE"
 
     if [ -f "$KEY_FILE" ]; then
         echo "✅ Certificado gerado e permissões ajustadas."
@@ -235,6 +233,20 @@ func_add_user() {
         domain=$(cat "$ACTIVE_DOMAIN_FILE" 2>/dev/null)
         if [ -z "$domain" ]; then domain=$(curl -s icanhazip.com); fi
     fi
+    
+    # --- LOGICA DE BUG HOST AUTOMÁTICO ---
+    # Verifica se existe um bug host configurado
+    local bughost_saved=$(cat "$BUG_HOST_FILE" 2>/dev/null)
+    local final_addr="$domain"
+    local final_sni="$domain"
+    
+    if [ -n "$bughost_saved" ]; then
+        # Se tiver bug host salvo, o Endereço e o SNI viram o Bug Host
+        final_addr="$bughost_saved"
+        final_sni="$bughost_saved"
+        # O "host=" continua sendo o $domain (real) para roteamento interno
+    fi
+    # -------------------------------------
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+$expiry_days days" +%F)
@@ -249,42 +261,37 @@ func_add_user() {
     echo "✅ Usuário criado: $nick (Expira: $expiry)"
     echo "UUID: $uuid"
     
-    # --- GERADOR DE LINK (Ordem Ajustada e path %2F) ---
+    # --- GERADOR DE LINK (Com suporte a BugHost) ---
     local link=""
-    
-    # Ajuste para garantir que o path seja encoded se for apenas /
     local path_encoded="%2F" 
     
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
-        # Ordem: mode(N/A) -> security -> encryption -> type -> serviceName -> sni
-        link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
+        link="vless://${uuid}@${final_addr}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${final_sni}#${nick}"
     
     elif [ "$net" == "ws" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path' "$CONFIG_PATH")
         if [ "$path" == "/" ]; then path="%2F"; fi
-        # Ordem: path -> security -> encryption -> host -> type -> sni
-        link="vless://${uuid}@${domain}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${domain}#${nick}"
+        # WS geralmente precisa do Host Real no header 'host' se estiver usando CDN, ou Bug se for direto
+        # Pela sua regra: Host HTTP = Dominio Real
+        link="vless://${uuid}@${final_addr}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${final_sni}#${nick}"
     
     elif [ "$net" == "xhttp" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path' "$CONFIG_PATH")
         if [ "$path" == "/" ]; then path="%2F"; fi
-        
-        # --- AQUI ESTÁ A MUDANÇA QUE VOCÊ PEDIU (Ordem exata do exemplo) ---
-        # mode -> path -> security -> encryption -> host -> type -> sni
-        link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${domain}#${nick}"
+        # XHTTP: Address=Bug, SNI=Bug, Host=Real
+        link="vless://${uuid}@${final_addr}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${final_sni}#${nick}"
     
     elif [ "$net" == "tcp" ] && [ "$sec" == "tls" ]; then
-        # Vision
+        # Vision (Cuidado: Vision geralmente precisa de SNI real, mas se for spoofing...)
         local flow=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").settings.flow // empty' "$CONFIG_PATH")
         if [ "$flow" == "xtls-rprx-vision" ]; then
-            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&flow=xtls-rprx-vision&type=tcp&sni=${domain}#${nick}"
+            link="vless://${uuid}@${final_addr}:${port}?security=tls&encryption=none&flow=xtls-rprx-vision&type=tcp&sni=${final_sni}#${nick}"
         else
-            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&type=tcp&sni=${domain}#${nick}"
+            link="vless://${uuid}@${final_addr}:${port}?security=tls&encryption=none&type=tcp&sni=${final_sni}#${nick}"
         fi
     else 
-        # TCP Simples
-        link="vless://${uuid}@${domain}:${port}?security=none&encryption=none&type=tcp#${nick}"
+        link="vless://${uuid}@${final_addr}:${port}?security=none&encryption=none&type=tcp#${nick}"
     fi
     
     echo "------------------------------------------------"
@@ -396,7 +403,6 @@ if [ -z "$1" ]; then
             3) func_list_users ;;
             5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
             6) 
-                # --- FLUXO DA OPÇÃO 6 ATUALIZADO ---
                 res=$(func_select_protocol)
                 if [ "$res" == "invalid" ]; then
                     echo "❌ Opção inválida."
@@ -405,7 +411,21 @@ if [ -z "$1" ]; then
                     read -rp "Porta [443]: " p; [ -z "$p" ] && p=443
                     read -rp "Domínio/IP: " d
                     
-                    # PERGUNTA SE QUER INSTALAR O CORE AGORA
+                    # --- NOVO: Configuração de BUG HOST ---
+                    echo "-----------------------------------------"
+                    echo "OPCIONAL: Deseja definir um BugHost/SNI padrão para os links?"
+                    echo "Ex: m.ofertas.tim.com.br"
+                    read -rp "Digite o BugHost (ou ENTER para usar conexão direta): " input_bughost
+                    
+                    if [ -n "$input_bughost" ]; then
+                        echo "$input_bughost" > "$BUG_HOST_FILE"
+                        echo "✅ BugHost definido: $input_bughost"
+                    else
+                        rm -f "$BUG_HOST_FILE"
+                        echo "✅ Modo Direto (Sem BugHost)."
+                    fi
+                    # ----------------------------------------
+                    
                     echo "-----------------------------------------"
                     read -rp "Deseja baixar/atualizar o binário Xray Oficial agora? (s/n): " install_now
                     if [[ "$install_now" =~ ^[Ss]$ ]]; then
