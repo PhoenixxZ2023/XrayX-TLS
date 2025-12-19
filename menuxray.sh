@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão: Lista Compacta (1 Linha) + Instalação Auto + BugHost
+# menuxray.sh - Versão Final: Lista Compacta (1 Linha) + Instalação Auto + BugHost
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -339,7 +339,7 @@ func_remove_user() {
     echo "✅ Usuário removido."
 }
 
-# --- LISTA COMPACTA (1 Linha, Sem Protocolo, Sem Link) ---
+# --- LISTA COMPACTA (1 Linha) ---
 func_list_users() {
     if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Xray não configurado."; return; fi
 
@@ -347,7 +347,7 @@ func_list_users() {
     echo "📋 LISTA DE USUÁRIOS"
     echo "========================================="
 
-    # Loop com apenas o necessário (ID, Nick, UUID, Expiry)
+    # Seleciona apenas os campos necessários
     while IFS='|' read -r id nick uuid expiry; do
         echo "🆔 ID: $id | 👤 Usuário: $nick | 📅 Expira: $expiry | 🔑 UUID: $uuid"
     done < <(db_query "SELECT id, nick, uuid, expiry FROM xray ORDER BY id")
@@ -355,7 +355,6 @@ func_list_users() {
     echo ""
     read -rp "Pressione ENTER para voltar ao menu..."
 }
-# ---------------------------------------------------------
 
 func_purge_expired() {
     local today=$(date +%F)
@@ -427,4 +426,62 @@ if [ -z "$1" ]; then
                     echo "-----------------------------------------"
                     read -rp "Nome de usuário (ou 0 para voltar): " n
                     if [ "$n" == "0" ] || [ -z "$n" ]; then break; fi
-                    check_
+                    check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$n' LIMIT 1")
+                    if [ -n "$check_exists" ]; then
+                        echo "❌ ERRO: O usuário '$n' JÁ EXISTE!"
+                        continue 
+                    fi
+                    read -rp "Digite os dias: " d
+                    [ -z "$d" ] && d=30
+                    func_add_user "$n" "$d"
+                    break 
+                done
+                ;;
+            2) read -rp "ID/UUID: " i; func_remove_user "$i" ;;
+            3) func_list_users ;;
+            5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
+            6) 
+                res=$(func_select_protocol)
+                if [ "$res" == "invalid" ]; then
+                    echo "❌ Opção inválida."
+                    read -rp "Enter..."
+                elif [ "$res" != "cancel" ]; then
+                    read -rp "Porta [443]: " p; [ -z "$p" ] && p=443
+                    read -rp "Domínio/IP: " d
+                    
+                    echo "-----------------------------------------"
+                    echo "OPCIONAL: Definir BugHost/SNI padrão?"
+                    read -rp "BugHost (Enter para Direto): " input_bughost
+                    
+                    if [ -n "$input_bughost" ]; then
+                        echo "$input_bughost" > "$BUG_HOST_FILE"
+                        echo "✅ BugHost definido: $input_bughost"
+                    else
+                        rm -f "$BUG_HOST_FILE"
+                        echo "✅ Modo Direto (Sem BugHost)."
+                    fi
+                    echo "-----------------------------------------"
+                    
+                    # --- INSTALAÇÃO AUTOMÁTICA (Sem pergunta) ---
+                    func_install_official_core
+                    # --------------------------------------------
+                    
+                    if [ "$res" == "vision" ]; then
+                         if func_check_cert && func_check_domain_ip "$d"; then
+                             func_generate_config "$p" "$res" "$d"
+                         fi
+                    else
+                         func_generate_config "$p" "$res" "$d"
+                    fi
+                    echo "$d" > "$ACTIVE_DOMAIN_FILE"
+                fi
+                ;;
+            8) func_purge_expired ;;
+            9) func_uninstall_xray ;; 
+            0) exit 0 ;;
+        esac
+        [ "$choice" != "0" ] && read -rp "Enter para voltar..."
+    done
+else
+    "$1" "${@:2}"
+fi
