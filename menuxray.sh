@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final: Lista Compacta (1 Linha) + Instalação Auto + BugHost
+# menuxray.sh - Versão: Simplificada (Sem BugHost) + Lista Limpa + Install Auto
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -14,7 +14,6 @@ KEY_FILE="$SSL_DIR/privkey.pem"
 CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
-BUG_HOST_FILE="$XRAY_DIR/bughost" 
 
 # Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
@@ -264,15 +263,9 @@ func_add_user() {
         if [ -z "$domain" ]; then domain=$(curl -s icanhazip.com); fi
     fi
     
-    # --- LOGICA DE BUG HOST AUTOMÁTICO ---
-    local bughost_saved=$(cat "$BUG_HOST_FILE" 2>/dev/null)
+    # --- SEM BUG HOST (Direto) ---
     local final_addr="$domain"
     local final_sni="$domain"
-    
-    if [ -n "$bughost_saved" ]; then
-        final_addr="$bughost_saved"
-        final_sni="$bughost_saved"
-    fi
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+$expiry_days days" +%F)
@@ -450,19 +443,7 @@ if [ -z "$1" ]; then
                     read -rp "Domínio/IP: " d
                     
                     echo "-----------------------------------------"
-                    echo "OPCIONAL: Definir BugHost/SNI padrão?"
-                    read -rp "BugHost (Enter para Direto): " input_bughost
-                    
-                    if [ -n "$input_bughost" ]; then
-                        echo "$input_bughost" > "$BUG_HOST_FILE"
-                        echo "✅ BugHost definido: $input_bughost"
-                    else
-                        rm -f "$BUG_HOST_FILE"
-                        echo "✅ Modo Direto (Sem BugHost)."
-                    fi
-                    echo "-----------------------------------------"
-                    
-                    # --- INSTALAÇÃO AUTOMÁTICA (Sem pergunta) ---
+                    # --- INSTALAÇÃO AUTOMÁTICA (Sem perguntas) ---
                     func_install_official_core
                     # --------------------------------------------
                     
