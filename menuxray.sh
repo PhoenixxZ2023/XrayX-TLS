@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final: Protocolos Livres + Correção Automática Vision
+# menuxray.sh - Versão Final: Visual Premium + Link VLESS na Criação
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -24,6 +24,7 @@ mkdir -p "$SSL_DIR"
 
 # --- CORES E VISUAL ---
 BLUE_BOLD='\033[1;34m'
+GREEN='\033[1;32m'
 RESET='\033[0m'
 
 # Função Header Padrão
@@ -149,11 +150,13 @@ func_generate_config() {
         echo "========================================="
         echo "📊 Resumo:"
         echo "   ► Protocolo:  $network"
-        echo "   ► Porta:      $port"
+        echo "   ► Porta Pub:  $port"
+        echo "   ► Porta Int:  $api_port"
         echo "   ► TLS Ativo:  $use_tls"
         echo "   ► Domínio:    $domain"
     else
         echo "❌ ERRO CRÍTICO: Xray falhou ao iniciar."
+        journalctl -u xray -n 10 --no-pager
     fi
     echo "========================================="
     read -rp "Pressione ENTER para voltar..."
@@ -181,11 +184,45 @@ func_add_user_logic() {
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
     systemctl restart xray 2>/dev/null
     
-    echo "✅ Usuário criado com sucesso!"
+    # --- GERADOR DE LINK (Restaurado) ---
+    local link=""
+    local path_encoded="%2F"
+    
+    if [ "$net" == "grpc" ]; then
+        local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
+        link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
+    elif [ "$net" == "ws" ]; then
+        local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path' "$CONFIG_PATH")
+        if [ "$path" == "/" ]; then path="%2F"; fi
+        link="vless://${uuid}@${domain}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${domain}#${nick}"
+    elif [ "$net" == "xhttp" ]; then
+        local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path' "$CONFIG_PATH")
+        if [ "$path" == "/" ]; then path="%2F"; fi
+        if [ "$sec" == "tls" ]; then
+            link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${domain}#${nick}"
+        else
+            link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=none&encryption=none&host=${domain}&type=xhttp#${nick}"
+        fi
+    elif [ "$net" == "tcp" ] || [ "$net" == "vision" ]; then
+        local flow=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").settings.flow // empty' "$CONFIG_PATH")
+        if [ "$flow" == "xtls-rprx-vision" ]; then
+            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&flow=xtls-rprx-vision&type=tcp&sni=${domain}#${nick}"
+        elif [ "$sec" == "tls" ]; then
+            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&type=tcp&sni=${domain}#${nick}"
+        else
+            link="vless://${uuid}@${domain}:${port}?security=none&encryption=none&type=tcp#${nick}"
+        fi
+    fi
+
+    # --- EXIBIÇÃO ---
+    echo -e "${GREEN}✅ Usuário criado com sucesso!${RESET}"
     echo "-----------------------------------------"
     echo "👤 Usuário: $nick"
     echo "📅 Expira:  $expiry"
     echo "🔑 UUID:    $uuid"
+    echo "-----------------------------------------"
+    echo -e "${BLUE_BOLD}🔗 Link de Conexão:${RESET}"
+    echo "$link"
     echo "-----------------------------------------"
 }
 
@@ -292,7 +329,6 @@ func_wizard_install() {
     # PASSO 5 - Domínio e Protocolo
     header_blue "CONFIGURAÇÃO - PASSO 5/5"
     local domain_val=""
-    
     if [ "$use_tls" == "true" ]; then
         echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
         read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
