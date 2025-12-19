@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão: Visual Premium (Azul Negrito + Telas Limpas)
+# menuxray.sh - Versão Final: Protocolos Livres + Correção Automática Vision
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -26,7 +26,7 @@ mkdir -p "$SSL_DIR"
 BLUE_BOLD='\033[1;34m'
 RESET='\033[0m'
 
-# Função para criar o cabeçalho padrão (Limpa tela + Título Azul)
+# Função Header Padrão
 header_blue() {
     clear
     echo -e "${BLUE_BOLD}=========================================${RESET}"
@@ -35,7 +35,7 @@ header_blue() {
     echo ""
 }
 
-# --- FUNÇÕES DE LÓGICA (DB e Xray) ---
+# --- FUNÇÕES DE LÓGICA ---
 
 db_query() {
     psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
@@ -105,7 +105,6 @@ func_generate_config() {
 
     local stream_settings=""
     
-    # Lógica de JSON simplificada para caber no script
     if [ "$network" == "xhttp" ]; then
         if [ "$use_tls" = "true" ]; then
             stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network: "xhttp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], alpn: ["h2", "http/1.1"]}, xhttpSettings: {path: "/", scMaxBufferedPosts: 30}}')
@@ -163,7 +162,6 @@ func_generate_config() {
 func_add_user_logic() {
     local nick="$1"
     local expiry_days="$2"
-    
     if [ -z "$nick" ]; then echo "❌ Erro: Nome vazio."; return 1; fi
     if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Erro: Xray não configurado."; return 1; fi
 
@@ -189,9 +187,6 @@ func_add_user_logic() {
     echo "📅 Expira:  $expiry"
     echo "🔑 UUID:    $uuid"
     echo "-----------------------------------------"
-    
-    # Gerador de Link VLESS (Oculto, só para uso interno se precisar, mas aqui não exibe)
-    # (Mantido caso queira reativar no futuro)
 }
 
 func_remove_user_logic() {
@@ -199,7 +194,6 @@ func_remove_user_logic() {
     local uuid=""
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then uuid=$(db_query "SELECT uuid FROM xray WHERE id = $identifier");
     else uuid=$(db_query "SELECT uuid FROM xray WHERE uuid = '$identifier'"); fi
-    
     if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return 1; fi
     jq --arg uuid "$uuid" '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) |= map(select(.id != $uuid))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     db_query "DELETE FROM xray WHERE uuid = '$uuid'"
@@ -207,28 +201,18 @@ func_remove_user_logic() {
     echo "✅ Usuário removido com sucesso."
 }
 
-# --- PÁGINAS DO MENU (UI) ---
+# --- PÁGINAS DO MENU ---
 
 func_page_create_user() {
     while true; do
         header_blue "CRIAR USUÁRIO"
         read -rp "Nome do usuário (0 p/ voltar): " nick
         if [ "$nick" == "0" ] || [ -z "$nick" ]; then break; fi
-        
         check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$nick' LIMIT 1")
-        if [ -n "$check_exists" ]; then
-            echo "❌ ERRO: O usuário '$nick' JÁ EXISTE!"
-            read -rp "Enter..."
-            continue
-        fi
-        
+        if [ -n "$check_exists" ]; then echo "❌ ERRO: O usuário '$nick' JÁ EXISTE!"; read -rp "Enter..."; continue; fi
         read -rp "Dias de validade (Padrão 30): " days
         [ -z "$days" ] && days=30
-        
-        echo ""
-        func_add_user_logic "$nick" "$days"
-        
-        echo ""
+        echo ""; func_add_user_logic "$nick" "$days"; echo ""
         read -rp "Pressione ENTER para continuar..."
     done
 }
@@ -237,24 +221,17 @@ func_page_remove_user() {
     header_blue "REMOVER USUÁRIO"
     echo "Digite o ID ou UUID do usuário."
     read -rp "Identificador: " id_input
-    if [ -n "$id_input" ]; then
-        func_remove_user_logic "$id_input"
-    fi
-    echo ""
-    read -rp "Pressione ENTER para voltar..."
+    if [ -n "$id_input" ]; then func_remove_user_logic "$id_input"; fi
+    echo ""; read -rp "Pressione ENTER para voltar..."
 }
 
 func_page_list_users() {
     if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Xray não configurado."; read -rp "Enter..."; return; fi
     header_blue "LISTAR USUÁRIOS"
-    
-    # Loop compacto 1 linha
     while IFS='|' read -r id nick uuid expiry; do
         echo "🆔 ID: $id | 👤 Usuário: $nick | 📅 Expira: $expiry | 🔑 UUID: $uuid"
     done < <(db_query "SELECT id, nick, uuid, expiry FROM xray ORDER BY id")
-    
-    echo ""
-    read -rp "Pressione ENTER para voltar..."
+    echo ""; read -rp "Pressione ENTER para voltar..."
 }
 
 func_page_purge_expired() {
@@ -262,17 +239,11 @@ func_page_purge_expired() {
     local today=$(date +%F)
     echo "Buscando usuários vencidos antes de $today..."
     local expired_uuids=$(db_query "SELECT uuid FROM xray WHERE expiry < '$today'")
-    
-    if [ -z "$expired_uuids" ]; then
-        echo "✅ Nenhum usuário expirado encontrado."
-    else
-        for uuid in $expired_uuids; do 
-            func_remove_user_logic "$uuid"
-        done
+    if [ -z "$expired_uuids" ]; then echo "✅ Nenhum usuário expirado encontrado."; else
+        for uuid in $expired_uuids; do func_remove_user_logic "$uuid"; done
         echo "✅ Limpeza concluída."
     fi
-    echo ""
-    read -rp "Pressione ENTER para voltar..."
+    echo ""; read -rp "Pressione ENTER para voltar..."
 }
 
 func_page_uninstall() {
@@ -280,10 +251,8 @@ func_page_uninstall() {
     echo "⚠️  ATENÇÃO: ISSO APAGARÁ TUDO!"
     echo " - Xray Core e Configurações"
     echo " - Banco de Dados e Usuários"
-    echo ""
-    read -rp "Digite 'SIM' para confirmar: " confirm
+    echo ""; read -rp "Digite 'SIM' para confirmar: " confirm
     if [ "$confirm" != "SIM" ]; then echo "❌ Cancelado."; return; fi
-
     systemctl stop xray 2>/dev/null; systemctl disable xray 2>/dev/null
     rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
     rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload
@@ -296,14 +265,12 @@ func_page_uninstall() {
 
 # --- WIZARD DE INSTALAÇÃO (Opção 4) ---
 func_wizard_install() {
-    # PASSO 1: Instalação
+    # PASSO 1
     header_blue "INSTALAÇÃO GUIADA - PASSO 1/5"
     read -rp "Deseja instalar/atualizar o Xray Core? (s/n): " install_opt
-    if [[ "$install_opt" =~ ^[Ss]$ ]]; then
-        func_install_official_core
-    fi
+    if [[ "$install_opt" =~ ^[Ss]$ ]]; then func_install_official_core; fi
 
-    # PASSO 2: TLS
+    # PASSO 2
     header_blue "CONFIGURAÇÃO - PASSO 2/5"
     echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
     echo "1) SIM - Requer domínio (Recomendado)"
@@ -312,19 +279,20 @@ func_wizard_install() {
     local use_tls="false"
     if [ "$tls_opt" == "1" ]; then use_tls="true"; fi
 
-    # PASSO 3: Porta Interna
+    # PASSO 3
     header_blue "CONFIGURAÇÃO - PASSO 3/5"
     read -rp "Digite a porta interna do Xray [Padrão 1080]: " api_port
     if [ -z "$api_port" ]; then api_port="1080"; fi
 
-    # PASSO 4: Porta Pública
+    # PASSO 4
     header_blue "CONFIGURAÇÃO - PASSO 4/5"
     read -rp "Digite a porta de conexão pública (Ex: 443, 80, 8080): " pub_port
     if [ -z "$pub_port" ]; then pub_port="80"; fi
 
-    # PASSO 5: Domínio/IP e Protocolo
+    # PASSO 5 - Domínio e Protocolo
     header_blue "CONFIGURAÇÃO - PASSO 5/5"
     local domain_val=""
+    
     if [ "$use_tls" == "true" ]; then
         echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
         read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
@@ -338,15 +306,17 @@ func_wizard_install() {
     fi
     echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
 
-    echo "-----------------------------------------"
-    echo "Selecione o Protocolo:"
+    # Seleção de Protocolo (SEMPRE MOSTRA TODOS)
+    sleep 1
+    header_blue "SELECIONE O PROTOCOLO"
     echo "1. ws (WebSocket)"
     echo "2. grpc (gRPC)"
     echo "3. xhttp (HTTP/2)"
     echo "4. tcp (Simples)"
-    if [ "$use_tls" == "true" ]; then echo "5. vision (XTLS-Vision) - 🚀"; fi
+    echo "5. vision (XTLS-Vision) - 🚀"
     echo "0. Cancelar"
-    read -rp "Opção: " prot_opt
+    echo ""
+    read -rp "Digite o número da opção: " prot_opt
     
     local selected_net=""
     case "$prot_opt" in
@@ -355,14 +325,25 @@ func_wizard_install() {
         3) selected_net="xhttp" ;;
         4) selected_net="tcp" ;;
         5) 
-            if [ "$use_tls" == "true" ]; then selected_net="vision"; 
-            else echo "❌ Vision requer TLS."; sleep 2; return; fi 
+            selected_net="vision"
+            # CORREÇÃO AUTOMÁTICA DE TLS PARA VISION
+            if [ "$use_tls" == "false" ]; then
+                echo ""
+                echo "⚠️  O protocolo Vision EXIGE TLS/SSL."
+                echo "Vamos configurar o domínio e certificado agora."
+                echo ""
+                read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
+                if ! func_check_domain_ip "$domain_val"; then return; fi
+                func_xray_cert "$domain_val"
+                if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
+                use_tls="true" # Força TLS para true
+                echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
+            fi
             ;;
         0) return ;;
         *) echo "❌ Inválido."; sleep 2; return ;;
     esac
 
-    # FINALIZAR
     func_generate_config "$pub_port" "$selected_net" "$domain_val" "$api_port" "$use_tls"
 }
 
@@ -395,5 +376,4 @@ if [ -z "$1" ]; then
             0) exit 0 ;;
         esac
     done
-else "$1" "${@:2}"; 
-fi
+else "$1" "${@:2}"; fi
