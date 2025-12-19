@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final: Menu Limpo + Instalação Expert
+# menuxray.sh - Versão Final: Sequência Numérica Perfeita (1 a 6)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -66,7 +66,6 @@ func_check_domain_ip() {
     return 0
 }
 
-# Mantemos a função interna, pois o Wizard usa ela!
 func_xray_cert() {
     local domain="$1"
     if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
@@ -168,7 +167,6 @@ func_add_user() {
     local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
     local domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
     
-    # Se não tiver domínio no JSON (modo sem TLS), usa IP
     if [ -z "$domain" ]; then
         domain=$(curl -s icanhazip.com)
     fi
@@ -267,7 +265,7 @@ func_uninstall_xray() {
     echo "✅ Desinstalação Completa!"; exit 0
 }
 
-# --- WIZARD DE INSTALAÇÃO (Opção 6) ---
+# --- WIZARD DE INSTALAÇÃO (Opção 4) ---
 func_wizard_install() {
     echo "========================================="
     echo "🛠️  Configuração Avançada do Xray"
@@ -353,9 +351,9 @@ menu_display() {
     echo "1. Criar Usuário"
     echo "2. Remover Usuário"
     echo "3. Listar Usuários"
-    echo "6. Instalar e Configurar Xray (Assistente)"
-    echo "8. Limpar Expirados"
-    echo "9. Desinstalar (Completo)"
+    echo "4. Instalar e Configurar Xray (Assistente)"
+    echo "5. Limpar Expirados"
+    echo "6. Desinstalar (Completo)"
     echo "0. Sair"
     read -rp "Opção: " choice
 }
@@ -374,9 +372,9 @@ if [ -z "$1" ]; then
                 done ;;
             2) read -rp "ID/UUID: " i; func_remove_user "$i" ;;
             3) func_list_users ;;
-            6) func_wizard_install ;;
-            8) func_purge_expired ;;
-            9) func_uninstall_xray ;; 
+            4) func_wizard_install ;;
+            5) func_purge_expired ;;
+            6) func_uninstall_xray ;; 
             0) exit 0 ;;
         esac
         [ "$choice" != "0" ] && [ "$choice" != "3" ] && read -rp "Enter para voltar..."
