@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão: Expert Mode (Fluxo Personalizado + Lista Limpa)
+# menuxray.sh - Versão Final: Menu Limpo + Instalação Expert
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -66,6 +66,7 @@ func_check_domain_ip() {
     return 0
 }
 
+# Mantemos a função interna, pois o Wizard usa ela!
 func_xray_cert() {
     local domain="$1"
     if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
@@ -80,7 +81,6 @@ func_xray_cert() {
     if [ -f "$KEY_FILE" ]; then echo "✅ Certificado OK."; else echo "❌ Falha ao gerar."; return 1; fi
 }
 
-# --- FUNÇÃO PRINCIPAL DE GERAÇÃO (Atualizada para aceitar API Port e TLS Mode) ---
 func_generate_config() {
     local port="$1"
     local network="$2"
@@ -115,11 +115,9 @@ func_generate_config() {
             stream_settings=$(jq -n '{network: "grpc", security: "none", grpcSettings: {serviceName: "gRPC"}}')
         fi
     elif [ "$network" == "vision" ]; then
-        # Vision sempre requer TLS
         stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
             '{network: "tcp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], minVersion: "1.2", allowInsecure: true}, tcpSettings: {header: {type: "none"}}}')
     else 
-        # TCP
         if [ "$use_tls" = "true" ]; then
              stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
                 '{network: "tcp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}]}}')
@@ -128,7 +126,6 @@ func_generate_config() {
         fi
     fi
 
-    # Gera o JSON usando a API PORT variavel
     jq -n --argjson stream "$stream_settings" --arg port "$port" --arg api "$api_port" \
       '{
           log: {loglevel: "warning"}, 
@@ -169,11 +166,11 @@ func_add_user() {
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
     local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
-    
     local domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
+    
+    # Se não tiver domínio no JSON (modo sem TLS), usa IP
     if [ -z "$domain" ]; then
-        domain=$(cat "$ACTIVE_DOMAIN_FILE" 2>/dev/null)
-        if [ -z "$domain" ]; then domain=$(curl -s icanhazip.com); fi
+        domain=$(curl -s icanhazip.com)
     fi
 
     local uuid=$(uuidgen)
@@ -254,8 +251,12 @@ func_purge_expired() {
 }
 
 func_uninstall_xray() {
-    echo "⚠️  DESINSTALAÇÃO COMPLETA"; echo "Isso removerá TUDO."; read -rp "Digite 'SIM' para confirmar: " confirm
+    echo "========================================="
+    echo "⚠️  DESINSTALAÇÃO COMPLETA"
+    echo "========================================="
+    read -rp "Digite 'SIM' para confirmar: " confirm
     if [ "$confirm" != "SIM" ]; then echo "❌ Cancelado."; return; fi
+
     systemctl stop xray 2>/dev/null; systemctl disable xray 2>/dev/null
     rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
     rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload
@@ -266,7 +267,7 @@ func_uninstall_xray() {
     echo "✅ Desinstalação Completa!"; exit 0
 }
 
-# --- NOVO WIZARD DE INSTALAÇÃO (Opção 6) ---
+# --- WIZARD DE INSTALAÇÃO (Opção 6) ---
 func_wizard_install() {
     echo "========================================="
     echo "🛠️  Configuração Avançada do Xray"
@@ -281,7 +282,7 @@ func_wizard_install() {
     # 2. TLS/SSL?
     echo "-----------------------------------------"
     echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
-    echo "1) SIM - Requer domínio (Recomendado para Vision/XHTTP)"
+    echo "1) SIM - Requer domínio (Recomendado)"
     echo "2) NÃO - Conexão simples (Pode usar IP)"
     read -rp "Opção [1/2]: " tls_opt
     
@@ -352,7 +353,6 @@ menu_display() {
     echo "1. Criar Usuário"
     echo "2. Remover Usuário"
     echo "3. Listar Usuários"
-    echo "5. Gerar Certificado TLS (Manual)"
     echo "6. Instalar e Configurar Xray (Assistente)"
     echo "8. Limpar Expirados"
     echo "9. Desinstalar (Completo)"
@@ -374,7 +374,6 @@ if [ -z "$1" ]; then
                 done ;;
             2) read -rp "ID/UUID: " i; func_remove_user "$i" ;;
             3) func_list_users ;;
-            5) read -rp "Domínio: " d; func_xray_cert "$d" ;;
             6) func_wizard_install ;;
             8) func_purge_expired ;;
             9) func_uninstall_xray ;; 
@@ -382,4 +381,5 @@ if [ -z "$1" ]; then
         esac
         [ "$choice" != "0" ] && [ "$choice" != "3" ] && read -rp "Enter para voltar..."
     done
-else "$1" "${@:2}"; fi
+else "$1" "${@:2}"; 
+fi
