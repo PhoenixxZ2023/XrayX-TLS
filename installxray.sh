@@ -1,11 +1,12 @@
 #!/bin/bash
-# installxray.sh - Instalador Automático DragonCore Xray
+# installxray.sh - Instalador Leve (Dependências + DB + Menu)
+# O Xray Core será instalado apenas via Menu (Opção 6)
 # Repositório: https://github.com/PhoenixxZ2023/XrayX-TLS
 
 # --- Variáveis ---
 XRAY_DIR="/opt/XrayTools"
 MENU_DESTINATION="$XRAY_DIR/menuxray.sh"
-# Link do seu repositório (Certifique-se que o menuxray.sh lá já é o novo!)
+# Link do seu repositório
 MENU_GITHUB_URL="https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/menuxray.sh"
 
 # --- CONFIGURAÇÃO DB (O script injeta isso no menu) ---
@@ -18,10 +19,10 @@ DB_PASS="senha"
 if [ "$EUID" -ne 0 ]; then echo "❌ Execute como root!"; exit 1; fi
 
 echo "=================================================="
-echo "🚀 Instalando DragonCore Xray Manager"
+echo "🚀 Preparando Ambiente DragonCore Xray"
 echo "=================================================="
 
-# 1. Dependências
+# 1. Dependências do Sistema (Essenciais para o Menu funcionar)
 echo "1. Instalando dependências do sistema..."
 apt update -y >/dev/null 2>&1
 apt install -y uuid-runtime curl jq net-tools openssl wget postgresql postgresql-contrib cron >/dev/null 2>&1
@@ -29,7 +30,6 @@ echo "✅ Dependências OK."
 
 # 2. Banco de Dados
 echo "2. Configurando PostgreSQL..."
-# Define senha temporária para comandos
 export PGPASSWORD=$DB_PASS
 systemctl start postgresql
 systemctl enable postgresql
@@ -47,22 +47,15 @@ wget -qO "$MENU_DESTINATION" "$MENU_GITHUB_URL"
 
 if [ $? -ne 0 ] || [ ! -s "$MENU_DESTINATION" ]; then
     echo "❌ ERRO CRÍTICO: Não foi possível baixar o menuxray.sh."
-    echo "Verifique se o arquivo existe no repositório GitHub."
     exit 1
 fi
 echo "✅ Menu baixado."
 
-# 4. Instalar Xray Core (Binário Oficial)
-echo "4. Instalando Xray Core Oficial..."
-if ! command -v xray &> /dev/null; then
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
-    echo "✅ Xray Core instalado."
-else
-    echo "ℹ️  Xray Core já estava instalado."
-fi
+# --- REMOVIDO: A instalação do Xray Core foi retirada daqui. ---
+# Ela será feita exclusivamente pela Opção 6 do Menu.
 
-# 5. Configuração Final
-echo "5. Configurando permissões e atalhos..."
+# 4. Configuração Final
+echo "4. Configurando permissões e atalhos..."
 chmod +x "$MENU_DESTINATION"
 
 # Injeta as credenciais do DB dentro do arquivo do menu
@@ -85,7 +78,8 @@ unset PGPASSWORD
 
 echo ""
 echo "=================================================="
-echo "🎉 INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
+echo "🎉 AMBIENTE PREPARADO COM SUCESSO!"
 echo "=================================================="
-echo "Comando para acessar: xray-menu"
+echo "⚠️  IMPORTANTE: O Xray Core AINDA NÃO ESTÁ INSTALADO."
+echo "👉 Digite 'xray-menu' e vá na OPÇÃO 6 para instalar e configurar."
 echo "=================================================="
