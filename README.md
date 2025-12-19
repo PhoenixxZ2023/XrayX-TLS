@@ -37,5 +37,5 @@ sudo apt update && sudo apt install -y wget && wget -qO installxray.sh https://r
 
 
 ````
-bash <(wget -qO- https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/installxray.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/PhoenixxZ2023/XrayX-TLS/main/installxray.sh) && xray-menu
 ````
