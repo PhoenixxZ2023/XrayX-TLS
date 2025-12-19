@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão: Suporte Automático a Bug Host/SNI
+# menuxray.sh - Versão: Base BugHost + Lista Limpa (Sem VLESS)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -312,62 +312,26 @@ func_remove_user() {
     echo "✅ Usuário removido."
 }
 
+# --- NOVA OPÇÃO 3 (Lista Limpa: Apenas Dados e UUID) ---
 func_list_users() {
     if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Xray não configurado."; return; fi
-    
-    # 1. Carrega configs globais para remontar os links
-    local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
-    local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
-    local ws_path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path // "/"' "$CONFIG_PATH")
-    local grpc_service=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName // ""' "$CONFIG_PATH")
-    local xhttp_path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path // "/"' "$CONFIG_PATH")
-    local flow=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").settings.flow // empty' "$CONFIG_PATH")
-    
-    local bughost=$(cat "$BUG_HOST_FILE" 2>/dev/null)
 
     echo "========================================="
-    echo "📋 LISTA COMPLETA DE USUÁRIOS"
+    echo "📋 LISTA DE USUÁRIOS (Sem Links)"
     echo "========================================="
 
-    # Loop para ler cada usuário do banco
-    while IFS='|' read -r id nick uuid expiry protocol domain; do
-        
-        # Lógica de BugHost
-        local final_addr="$domain"
-        local final_sni="$domain"
-        if [ -n "$bughost" ]; then final_addr="$bughost"; final_sni="$bughost"; fi
-        
-        local link=""
-        local path_encoded="%2F"
-
-        # Reconstrói o link
-        if [ "$protocol" == "grpc" ]; then
-            link="vless://${uuid}@${final_addr}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${grpc_service}&sni=${final_sni}#${nick}"
-        elif [ "$protocol" == "ws" ]; then
-            if [ "$ws_path" != "/" ]; then path_encoded="$ws_path"; fi
-            link="vless://${uuid}@${final_addr}:${port}?path=${path_encoded}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${final_sni}#${nick}"
-        elif [ "$protocol" == "xhttp" ]; then
-            if [ "$xhttp_path" != "/" ]; then path_encoded="$xhttp_path"; fi
-            link="vless://${uuid}@${final_addr}:${port}?mode=auto&path=${path_encoded}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${final_sni}#${nick}"
-        elif [ "$protocol" == "tcp" ] || [ "$protocol" == "vision" ]; then
-             if [ "$flow" == "xtls-rprx-vision" ] && [ "$sec" == "tls" ]; then
-                link="vless://${uuid}@${final_addr}:${port}?security=tls&encryption=none&flow=xtls-rprx-vision&type=tcp&sni=${final_sni}#${nick}"
-             else
-                link="vless://${uuid}@${final_addr}:${port}?security=${sec}&encryption=none&type=tcp&sni=${final_sni}#${nick}"
-             fi
-        fi
-
-        echo "🆔 ID: $id | Usuário: $nick | Exp: $expiry"
+    # Seleciona ID, Nome, UUID, Data e Protocolo (Sem VLESS)
+    while IFS='|' read -r id nick uuid expiry protocol; do
+        echo "🆔 ID: $id  | 👤 Usuário: $nick"
+        echo "📅 Expira: $expiry | ⚙️ Protocolo: $protocol"
         echo "🔑 UUID: $uuid"
-        echo "🔗 $link"
         echo "-----------------------------------------"
-        
-    done < <(db_query "SELECT id, nick, uuid, expiry, protocol, domain FROM xray ORDER BY id")
+    done < <(db_query "SELECT id, nick, uuid, expiry, protocol FROM xray ORDER BY id")
     
-    # Pausa para leitura
     echo ""
     read -rp "Pressione ENTER para voltar ao menu..."
 }
+# --------------------------------------------------------
 
 func_purge_expired() {
     local today=$(date +%F)
