@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Final: Visual Premium + Link VLESS na Criação
+# menuxray.sh - Versão V3: Todas as opções + REALITY Integrado
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -14,6 +14,7 @@ KEY_FILE="$SSL_DIR/privkey.pem"
 CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
+REALITY_PUB_FILE="$XRAY_DIR/reality.pub" # Arquivo para salvar a chave pública do Reality
 
 # Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
@@ -25,6 +26,7 @@ mkdir -p "$SSL_DIR"
 # --- CORES E VISUAL ---
 BLUE_BOLD='\033[1;34m'
 GREEN='\033[1;32m'
+RED='\033[1;31m'
 RESET='\033[0m'
 
 # Função Header Padrão
@@ -40,12 +42,6 @@ header_blue() {
 
 db_query() {
     psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
-}
-
-func_create_db_table() {
-    local sql="CREATE TABLE IF NOT EXISTS xray (id SERIAL PRIMARY KEY, uuid TEXT, nick TEXT, expiry DATE, protocol TEXT, domain TEXT);"
-    db_query "$sql"
-    if [ $? -eq 0 ]; then echo "✅ Tabela verificada/criada."; else echo "❌ ERRO: Falha ao acessar o DB."; fi
 }
 
 func_install_official_core() {
@@ -74,7 +70,7 @@ func_check_domain_ip() {
     if [ -z "$domain_ip" ]; then echo "❌ Erro DNS: Não resolveu '$domain'."; return 1; fi
     if [ "$domain_ip" != "$vps_ip" ]; then
         echo "⚠️  AVISO: IP do domínio ($domain_ip) difere do IP da VPS ($vps_ip)."
-        read -rp "Continuar? (s/n): " confirm; [[ "$confirm" != "s" ]] && return 1
+        read -rp "Continuar mesmo assim? (s/n): " confirm; [[ "$confirm" != "s" ]] && return 1
     fi
     echo "✅ Domínio verificado."
     return 0
@@ -83,7 +79,8 @@ func_check_domain_ip() {
 func_xray_cert() {
     local domain="$1"
     if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
-    if ! func_check_domain_ip "$domain"; then return 1; fi
+    # Pula verificação rigorosa para permitir configurar antes da propagação se o usuário quiser
+    # if ! func_check_domain_ip "$domain"; then return 1; fi
     
     mkdir -p "$SSL_DIR"
     echo "Gerando certificado para $domain..."
@@ -99,14 +96,31 @@ func_generate_config() {
     local network="$2"
     local domain="$3"
     local api_port="$4"
-    local use_tls="$5" 
+    local use_tls="$5"
+    # Argumentos extras para Reality
+    local reality_dest="$6"
+    local reality_names="$7"
+    local reality_private="$8"
+    local reality_shortid="$9"
     
     mkdir -p "$(dirname "$CONFIG_PATH")"
     if [ -d "$SSL_DIR" ]; then chmod 755 "$SSL_DIR"; chmod 644 "$SSL_DIR"/* 2>/dev/null; fi
 
     local stream_settings=""
+    local protocol_settings='{clients: [], decryption: "none", fallbacks: []}'
     
-    if [ "$network" == "xhttp" ]; then
+    # --- LOGICA DE PROTOCOLOS ---
+    if [ "$network" == "reality" ]; then
+        # Configuração Específica REALITY
+        protocol_settings=$(jq -n --arg dest "$reality_dest" '{clients: [], decryption: "none", fallbacks: [{dest: $dest, xver: 0}]}')
+        stream_settings=$(jq -n \
+            --arg dest "$reality_dest" \
+            --argjson names "$reality_names" \
+            --arg pk "$reality_private" \
+            --argjson sid "[\"$reality_shortid\"]" \
+            '{network: "tcp", security: "reality", realitySettings: {show: false, dest: $dest, xver: 0, serverNames: $names, privateKey: $pk, shortIds: $sid}, tcpSettings: {header: {type: "none"}}}')
+
+    elif [ "$network" == "xhttp" ]; then
         if [ "$use_tls" = "true" ]; then
             stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network: "xhttp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], alpn: ["h2", "http/1.1"]}, xhttpSettings: {path: "/", scMaxBufferedPosts: 30}}')
         else
@@ -127,6 +141,7 @@ func_generate_config() {
     elif [ "$network" == "vision" ]; then
         stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network: "tcp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], minVersion: "1.2", allowInsecure: true}, tcpSettings: {header: {type: "none"}}}')
     else 
+        # TCP Simples
         if [ "$use_tls" = "true" ]; then
              stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network: "tcp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}]}}')
         else
@@ -134,10 +149,15 @@ func_generate_config() {
         fi
     fi
 
-    jq -n --argjson stream "$stream_settings" --arg port "$port" --arg api "$api_port" \
-      '{log: {loglevel: "warning"}, api: {services: ["HandlerService", "LoggerService", "StatsService"], tag: "api"}, inbounds: [{tag: "api", port: ($api | tonumber), protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, listen: "127.0.0.1"}, {tag: "inbound-dragoncore", port: ($port | tonumber), protocol: "vless", settings: {clients: [], decryption: "none", fallbacks: []}, streamSettings: $stream}], outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "blocked"}], routing: {domainStrategy: "AsIs", rules: [{type: "field", inboundTag: ["api"], outboundTag: "api"}]}}' > "$CONFIG_PATH"
+    # Monta o JSON Final
+    jq -n --argjson stream "$stream_settings" \
+          --argjson proto "$protocol_settings" \
+          --arg port "$port" \
+          --arg api "$api_port" \
+      '{log: {loglevel: "warning"}, api: {services: ["HandlerService", "LoggerService", "StatsService"], tag: "api"}, inbounds: [{tag: "api", port: ($api | tonumber), protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, listen: "127.0.0.1"}, {tag: "inbound-dragoncore", port: ($port | tonumber), protocol: "vless", settings: $proto, streamSettings: $stream}], outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "blocked"}], routing: {domainStrategy: "AsIs", rules: [{type: "field", inboundTag: ["api"], outboundTag: "api"}]}}' > "$CONFIG_PATH"
 
-    if [ "$network" == "vision" ]; then
+    # Adiciona flow para Vision e Reality
+    if [ "$network" == "vision" ] || [ "$network" == "reality" ]; then
         jq '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": "xtls-rprx-vision"}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
 
@@ -147,13 +167,9 @@ func_generate_config() {
     header_blue "STATUS DA INSTALAÇÃO"
     if systemctl is-active --quiet xray; then
         echo "✅ Configuração Aplicada com Sucesso!"
-        echo "========================================="
-        echo "📊 Resumo:"
         echo "   ► Protocolo:  $network"
         echo "   ► Porta Pub:  $port"
-        echo "   ► Porta Int:  $api_port"
-        echo "   ► TLS Ativo:  $use_tls"
-        echo "   ► Domínio:    $domain"
+        [ "$network" == "reality" ] && echo "   ► Modo:       REALITY (Camuflagem: $reality_dest)"
     else
         echo "❌ ERRO CRÍTICO: Xray falhou ao iniciar."
         journalctl -u xray -n 10 --no-pager
@@ -171,24 +187,47 @@ func_add_user_logic() {
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
     local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
-    local domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
-    if [ -z "$domain" ]; then domain=$(curl -s icanhazip.com); fi
+    
+    # Pega domínio apenas se NÃO for Reality
+    local domain=""
+    if [ "$sec" == "reality" ]; then
+        domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.realitySettings.serverNames[0]' "$CONFIG_PATH")
+    else
+        domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
+    fi
+    # Fallback para IP
+    local vps_ip=$(curl -s icanhazip.com)
+    if [ -z "$domain" ]; then domain=$vps_ip; fi
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+$expiry_days days" +%F)
 
+    # Inserir no JSON
     jq --arg uuid "$uuid" --arg nick_arg "$nick" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick_arg, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    
+    # Se for vision ou reality, adiciona flow no cliente também (opcional em algumas versões, obrigatório em outras)
+    if [ "$sec" == "reality" ] || [ "$net" == "vision" ]; then
+         jq --arg uuid "$uuid" \
+           '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients[] | select(.id == $uuid)) += {"flow": "xtls-rprx-vision"}' \
+           "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    fi
 
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
     systemctl restart xray 2>/dev/null
     
-    # --- GERADOR DE LINK (Restaurado) ---
+    # --- GERADOR DE LINK (Todas as opções) ---
     local link=""
-    local path_encoded="%2F"
     
-    if [ "$net" == "grpc" ]; then
+    if [ "$sec" == "reality" ]; then
+        # Gerador REALITY
+        local pbk=$(cat "$REALITY_PUB_FILE")
+        local sid=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.realitySettings.shortIds[0]' "$CONFIG_PATH")
+        # Reality usa o IP da VPS no address, e o site camuflado no SNI
+        link="vless://${uuid}@${vps_ip}:${port}?security=reality&encryption=none&pbk=${pbk}&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=${domain}&sid=${sid}#${nick}"
+        
+    elif [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
         link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
     elif [ "$net" == "ws" ]; then
@@ -220,6 +259,9 @@ func_add_user_logic() {
     echo "👤 Usuário: $nick"
     echo "📅 Expira:  $expiry"
     echo "🔑 UUID:    $uuid"
+    if [ "$sec" == "reality" ]; then
+         echo "🕵️  Modo:    REALITY (SNI Livre)"
+    fi
     echo "-----------------------------------------"
     echo -e "${BLUE_BOLD}🔗 Link de Conexão:${RESET}"
     echo "$link"
@@ -307,49 +349,14 @@ func_wizard_install() {
     read -rp "Deseja instalar/atualizar o Xray Core? (s/n): " install_opt
     if [[ "$install_opt" =~ ^[Ss]$ ]]; then func_install_official_core; fi
 
-    # PASSO 2
-    header_blue "CONFIGURAÇÃO - PASSO 2/5"
-    echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
-    echo "1) SIM - Requer domínio (Recomendado)"
-    echo "2) NÃO - Conexão simples (Pode usar IP)"
-    read -rp "Opção [1/2]: " tls_opt
-    local use_tls="false"
-    if [ "$tls_opt" == "1" ]; then use_tls="true"; fi
-
-    # PASSO 3
-    header_blue "CONFIGURAÇÃO - PASSO 3/5"
-    read -rp "Digite a porta interna do Xray [Padrão 1080]: " api_port
-    if [ -z "$api_port" ]; then api_port="1080"; fi
-
-    # PASSO 4
-    header_blue "CONFIGURAÇÃO - PASSO 4/5"
-    read -rp "Digite a porta de conexão pública (Ex: 443, 80, 8080): " pub_port
-    if [ -z "$pub_port" ]; then pub_port="80"; fi
-
-    # PASSO 5 - Domínio e Protocolo
-    header_blue "CONFIGURAÇÃO - PASSO 5/5"
-    local domain_val=""
-    if [ "$use_tls" == "true" ]; then
-        echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
-        read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
-        if ! func_check_domain_ip "$domain_val"; then return; fi
-        func_xray_cert "$domain_val" 
-        if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
-    else
-        echo "ℹ️  Modo sem TLS. Pode usar IP ou Domínio."
-        read -rp "Digite o Domínio ou IP (Enter para Auto-Detectar): " domain_val
-        if [ -z "$domain_val" ]; then domain_val=$(curl -s icanhazip.com); fi
-    fi
-    echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
-
-    # Seleção de Protocolo (SEMPRE MOSTRA TODOS)
-    sleep 1
+    # SELEÇÃO DE PROTOCOLO (Agora inclui REALITY)
     header_blue "SELECIONE O PROTOCOLO"
-    echo "1. ws (WebSocket)"
+    echo "1. ws (WebSocket) - Compatível com CDN/Cloudflare"
     echo "2. grpc (gRPC)"
     echo "3. xhttp (HTTP/2)"
     echo "4. tcp (Simples)"
-    echo "5. vision (XTLS-Vision) - 🚀"
+    echo "5. vision (XTLS-Vision) - Rápido, mas exige domínio limpo"
+    echo "6. reality (VLESS Reality) - 🏆 Melhor para Burlas/SNI Livre"
     echo "0. Cancelar"
     echo ""
     read -rp "Digite o número da opção: " prot_opt
@@ -360,38 +367,89 @@ func_wizard_install() {
         2) selected_net="grpc" ;;
         3) selected_net="xhttp" ;;
         4) selected_net="tcp" ;;
-        5) 
-            selected_net="vision"
-            # CORREÇÃO AUTOMÁTICA DE TLS PARA VISION
-            if [ "$use_tls" == "false" ]; then
-                echo ""
-                echo "⚠️  O protocolo Vision EXIGE TLS/SSL."
-                echo "Vamos configurar o domínio e certificado agora."
-                echo ""
-                read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
-                if ! func_check_domain_ip "$domain_val"; then return; fi
-                func_xray_cert "$domain_val"
-                if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
-                use_tls="true" # Força TLS para true
-                echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
-            fi
-            ;;
+        5) selected_net="vision" ;;
+        6) selected_net="reality" ;;
         0) return ;;
         *) echo "❌ Inválido."; sleep 2; return ;;
     esac
 
-    func_generate_config "$pub_port" "$selected_net" "$domain_val" "$api_port" "$use_tls"
+    # PORTAS
+    read -rp "Digite a porta interna [Padrão 1080]: " api_port
+    if [ -z "$api_port" ]; then api_port="1080"; fi
+    
+    # Se for Reality ou Vision, força 443 geralmente é melhor, mas deixamos escolher
+    read -rp "Digite a porta Pública [Padrão 443]: " pub_port
+    if [ -z "$pub_port" ]; then pub_port="443"; fi
+
+    # LÓGICA DE DOMÍNIO / CHAVES
+    local use_tls="false"
+    local domain_val=""
+    
+    # Variáveis Reality
+    local reality_dest=""
+    local reality_names=""
+    local reality_private=""
+    local reality_shortid=""
+
+    if [ "$selected_net" == "reality" ]; then
+        header_blue "CONFIGURAÇÃO REALITY"
+        echo "Gerando chaves de criptografia..."
+        local keys=$($XRAY_BIN x25519)
+        reality_private=$(echo "$keys" | grep "Private" | awk '{print $3}')
+        local reality_pub=$(echo "$keys" | grep "Public" | awk '{print $3}')
+        echo "$reality_pub" > "$REALITY_PUB_FILE"
+        
+        reality_shortid=$(openssl rand -hex 4)
+        
+        echo "Escolha o site para 'camuflar' (SNI Destino):"
+        echo "1) www.microsoft.com (Vivo/Tim)"
+        echo "2) www.google.com"
+        echo "3) www.amazon.com"
+        echo "4) Digitar outro"
+        read -rp "Opção: " sni_opt
+        case "$sni_opt" in
+            1) reality_dest="www.microsoft.com:443"; reality_names='["www.microsoft.com", "microsoft.com"]' ;;
+            2) reality_dest="www.google.com:443"; reality_names='["www.google.com", "google.com"]' ;;
+            3) reality_dest="www.amazon.com:443"; reality_names='["www.amazon.com"]' ;;
+            4) read -rp "Domínio (ex: learn.microsoft.com): " c_sni; reality_dest="${c_sni}:443"; reality_names="[\"$c_sni\"]" ;;
+            *) reality_dest="www.microsoft.com:443"; reality_names='["www.microsoft.com", "microsoft.com"]' ;;
+        esac
+        
+        domain_val=$(echo "$reality_names" | jq -r '.[0]') # Apenas para registro
+        use_tls="false" # Reality não usa o bloco TLS padrão
+
+    else
+        # CONFIGURAÇÃO PADRÃO (NÃO-REALITY)
+        echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
+        echo "1) SIM - Requer domínio (Recomendado)"
+        echo "2) NÃO - Conexão simples"
+        read -rp "Opção [1/2]: " tls_opt
+        if [ "$tls_opt" == "1" ] || [ "$selected_net" == "vision" ]; then
+            use_tls="true"
+            echo "Digite seu domínio (Ex: vpn.site.com): "
+            read -rp "Domínio: " domain_val
+            func_xray_cert "$domain_val"
+        else
+            domain_val=$(curl -s icanhazip.com)
+        fi
+    fi
+
+    echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
+
+    # CHAMA A FUNÇÃO GERADORA COM OS DADOS COLETADOS
+    func_generate_config "$pub_port" "$selected_net" "$domain_val" "$api_port" "$use_tls" \
+        "$reality_dest" "$reality_names" "$reality_private" "$reality_shortid"
 }
 
 # --- MENU PRINCIPAL ---
 menu_display() {
     clear
-    echo -e "${BLUE_BOLD}⚡ DRAGONCORE XRAY MANAGER${RESET}"
+    echo -e "${BLUE_BOLD}⚡ DRAGONCORE XRAY MANAGER v3.0${RESET}"
     echo "-----------------------------------------"
     echo "1. Criar Usuário"
     echo "2. Remover Usuário"
     echo "3. Listar Usuários"
-    echo "4. Instalar e Configurar Xray (Assistente)"
+    echo "4. Instalar / Reconfigurar (Mudar Protocolo)"
     echo "5. Limpar Expirados"
     echo "6. Desinstalar (Completo)"
     echo "0. Sair"
