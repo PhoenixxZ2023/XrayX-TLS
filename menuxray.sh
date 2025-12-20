@@ -1,10 +1,9 @@
 #!/bin/bash
-# menuxray.sh - Versão Premium UI (Auto-Fix Database)
+# menuxray.sh - Versão SUPREMA v4 (Link Corrigido: IP no Address + Fake SNI)
 
 # --- CONFIGURAÇÃO AUTOMÁTICA ---
-# Mesmo que isso esteja errado, o script vai tentar corrigir sozinho na função db_query
 DB_HOST="localhost"
-DB_NAME="sshplus" # Tentativa padrão
+DB_NAME="sshplus" 
 DB_USER="root"
 DB_PASS="null"
 
@@ -16,6 +15,7 @@ CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
 
+export PGPASSWORD=$DB_PASS
 mkdir -p "$XRAY_DIR"
 mkdir -p "$SSL_DIR"
 
@@ -34,32 +34,14 @@ header_blue() {
 }
 
 # --- FUNÇÃO DE BANCO DE DADOS INTELIGENTE ---
-# Tenta conectar de várias formas até conseguir
 db_query() {
     local query="$1"
     local result=""
-    
-    # 1. Tenta método padrão (se as variáveis estiverem certas)
     result=$(psql -h "localhost" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$query" 2>/dev/null)
-    
-    # 2. Se falhar, tenta via ROOT do Postgres (Bypassa senha) nos bancos comuns
-    if [ -z "$result" ]; then
-        # Tenta banco 'sshplus'
-        result=$(sudo -u postgres psql -d sshplus -t -A -c "$query" 2>/dev/null)
-    fi
-    if [ -z "$result" ]; then
-        # Tenta banco 'dtunnel'
-        result=$(sudo -u postgres psql -d dtunnel -t -A -c "$query" 2>/dev/null)
-    fi
-    if [ -z "$result" ]; then
-        # Tenta banco 'xray'
-        result=$(sudo -u postgres psql -d xray -t -A -c "$query" 2>/dev/null)
-    fi
-    if [ -z "$result" ]; then
-         # Tenta banco 'vpndb'
-        result=$(sudo -u postgres psql -d vpndb -t -A -c "$query" 2>/dev/null)
-    fi
-    
+    if [ -z "$result" ]; then result=$(sudo -u postgres psql -d sshplus -t -A -c "$query" 2>/dev/null); fi
+    if [ -z "$result" ]; then result=$(sudo -u postgres psql -d dtunnel -t -A -c "$query" 2>/dev/null); fi
+    if [ -z "$result" ]; then result=$(sudo -u postgres psql -d xray -t -A -c "$query" 2>/dev/null); fi
+    if [ -z "$result" ]; then result=$(sudo -u postgres psql -d vpndb -t -A -c "$query" 2>/dev/null); fi
     echo "$result"
 }
 
@@ -77,26 +59,16 @@ func_check_cert() {
     return 0
 }
 
-func_check_domain_ip() {
-    local domain="$1"
-    local vps_ip=$(curl -s icanhazip.com)
-    if [ -z "$domain" ]; then echo "❌ Vazio."; return 1; fi
-    local domain_ip=$(dig +short "$domain" | head -n 1)
-    if [ -z "$domain_ip" ]; then echo "❌ DNS falhou."; return 1; fi
-    if [ "$domain_ip" != "$vps_ip" ]; then
-        echo "⚠️  IP do domínio difere da VPS."
-        read -rp "Continuar? (s/n): " confirm; [[ "$confirm" != "s" ]] && return 1
-    fi
-    return 0
-}
-
+# --- FUNÇÃO CERTIFICADO (SEM VERIFICAÇÃO DE IP) ---
 func_xray_cert() {
     local domain="$1"
     mkdir -p "$SSL_DIR"
-    echo "Gerando SSL..."
+    echo "Gerando Certificado FAKE para: $domain..."
+    
     openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-        -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
+        -subj "/C=BR/ST=SP/L=SaoPaulo/O=Supremo/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" > /dev/null 2>&1
+    
     chmod 755 "$SSL_DIR"; chmod 644 "$KEY_FILE"; chmod 644 "$CRT_FILE"
 }
 
@@ -150,7 +122,7 @@ func_generate_config() {
     clear
     header_blue "STATUS DA INSTALAÇÃO"
     if systemctl is-active --quiet xray; then
-        echo -e "${TXT_GREEN}✅ Configuração Aplicada!${RESET}"
+        echo -e "${TXT_GREEN}✅ Configuração SUPREMA Aplicada!${RESET}"
     else
         echo -e "${TXT_RED}❌ Falha ao iniciar.${RESET}"
         journalctl -u xray -n 5 --no-pager
@@ -169,49 +141,52 @@ func_add_user_logic() {
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
     local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
+    # Pega o domínio do config (Pode ser o Fake)
     local domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
-    if [ -z "$domain" ]; then domain=$(curl -s icanhazip.com); fi
+    
+    # PEGA O IP REAL DA VPS PARA O ENDEREÇO DO LINK
+    local vps_ip=$(curl -s icanhazip.com)
+    if [ -z "$domain" ]; then domain=$vps_ip; fi
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+$expiry_days days" +%F)
 
-    # Verifica se o banco está respondendo ANTES de prosseguir
-    # Tenta criar tabela se não existir (Opcional, mas seguro)
     db_query "CREATE TABLE IF NOT EXISTS xray (id SERIAL PRIMARY KEY, uuid TEXT, nick TEXT, expiry DATE, protocol TEXT, domain TEXT);" > /dev/null 2>&1
 
     jq --arg uuid "$uuid" --arg nick_arg "$nick" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick_arg, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
-    # Tenta inserir
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
     
     systemctl restart xray > /dev/null 2>&1
     
+    # --- GERADOR DE LINK INTELIGENTE (IP no Address + Domínio no SNI) ---
     local link=""
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
-        link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
+        link="vless://${uuid}@${vps_ip}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
     elif [ "$net" == "ws" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path' "$CONFIG_PATH")
         [ "$path" == "/" ] && path="%2F"
-        link="vless://${uuid}@${domain}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${domain}#${nick}"
+        link="vless://${uuid}@${vps_ip}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${domain}#${nick}"
     elif [ "$net" == "xhttp" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path' "$CONFIG_PATH")
         [ "$path" == "/" ] && path="%2F"
         if [ "$sec" == "tls" ]; then
-            link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${domain}#${nick}"
+            # AQUI ESTÁ A CORREÇÃO: @${vps_ip} no endereço, &sni=${domain} no host
+            link="vless://${uuid}@${vps_ip}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${domain}#${nick}"
         else
-            link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=none&encryption=none&host=${domain}&type=xhttp#${nick}"
+            link="vless://${uuid}@${vps_ip}:${port}?mode=auto&path=${path}&security=none&encryption=none&host=${domain}&type=xhttp#${nick}"
         fi
     elif [ "$net" == "tcp" ] || [ "$net" == "vision" ]; then
         local flow=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").settings.flow // empty' "$CONFIG_PATH")
         if [ "$flow" == "xtls-rprx-vision" ]; then
-            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&flow=xtls-rprx-vision&type=tcp&sni=${domain}#${nick}"
+            link="vless://${uuid}@${vps_ip}:${port}?security=tls&encryption=none&flow=xtls-rprx-vision&type=tcp&sni=${domain}#${nick}"
         elif [ "$sec" == "tls" ]; then
-            link="vless://${uuid}@${domain}:${port}?security=tls&encryption=none&type=tcp&sni=${domain}#${nick}"
+            link="vless://${uuid}@${vps_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${domain}#${nick}"
         else
-            link="vless://${uuid}@${domain}:${port}?security=none&encryption=none&type=tcp#${nick}"
+            link="vless://${uuid}@${vps_ip}:${port}?security=none&encryption=none&type=tcp#${nick}"
         fi
     fi
 
@@ -306,15 +281,9 @@ func_page_uninstall() {
         echo "🚀 Iniciando desinstalação..."
         systemctl stop xray > /dev/null 2>&1
         systemctl disable xray > /dev/null 2>&1
-        rm -f /usr/local/bin/xray
-        rm -rf /usr/local/etc/xray
-        rm -rf /usr/local/share/xray
-        rm -f /etc/systemd/system/xray.service
-        rm -f /etc/systemd/system/xray@.service
-        systemctl daemon-reload > /dev/null 2>&1
-        rm -rf "$XRAY_DIR"
-        rm -rf "$SSL_DIR"
-        rm -f /bin/xray-menu
+        rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
+        rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload > /dev/null 2>&1
+        rm -rf "$XRAY_DIR"; rm -rf "$SSL_DIR"; rm -f /bin/xray-menu
         sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
         echo "✅ Desinstalação Completa!"; exit 0
     else
@@ -333,8 +302,8 @@ func_wizard_install() {
     # PASSO 2
     header_blue "CONFIGURAÇÃO (2/5)"
     echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
-    echo "1) SIM - Requer domínio (Recomendado)"
-    echo "2) NÃO - Conexão simples (Pode usar IP)"
+    echo "1) SIM - (MODO SUPREMO: Aceita qualquer domínio/Fake)"
+    echo "2) NÃO - Conexão simples"
     read -rp "Opção [1/2]: " tls_opt
     local use_tls="false"
     if [ "$tls_opt" == "1" ]; then use_tls="true"; fi
@@ -353,14 +322,14 @@ func_wizard_install() {
     header_blue "CONFIGURAÇÃO (5/5)"
     local domain_val=""
     if [ "$use_tls" == "true" ]; then
-        echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
-        read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
-        if ! func_check_domain_ip "$domain_val"; then return; fi
+        echo -e "${TXT_CYAN}MODO SUPREMO ATIVADO!${RESET}"
+        echo "Digite QUALQUER domínio que você quiser."
+        echo "Ex: www.batata.com, google.com, fake.net"
+        read -rp "Domínio: " domain_val
         func_xray_cert "$domain_val" 
-        if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
     else
-        echo "ℹ️  Modo sem TLS. Pode usar IP ou Domínio."
-        read -rp "Digite o Domínio ou IP (Enter para Auto-Detectar): " domain_val
+        echo "ℹ️  Modo sem TLS."
+        read -rp "Digite o Domínio ou IP: " domain_val
         if [ -z "$domain_val" ]; then domain_val=$(curl -s icanhazip.com); fi
     fi
     echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
@@ -384,9 +353,8 @@ func_wizard_install() {
         5) 
             selected_net="vision"
             if [ "$use_tls" == "false" ]; then
-                echo "⚠️  Vision exige TLS. Vamos configurar o domínio."
-                read -rp "Digite seu domínio: " domain_val
-                if ! func_check_domain_ip "$domain_val"; then return; fi
+                echo "⚠️  Vision exige TLS. Digite um domínio Fake:"
+                read -rp "Domínio: " domain_val
                 func_xray_cert "$domain_val"
                 use_tls="true"
                 echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
@@ -402,11 +370,9 @@ func_wizard_install() {
 # --- MENU PRINCIPAL UI ---
 menu_display() {
     clear
-    # Barra de Título (Fundo Branco, Texto Azul)
     echo -e "${TITLE_BAR}        DRAGONCORE XRAY MANAGER        ${RESET}"
     echo ""
 
-    # Captura de Status
     local status_txt="${TXT_RED}DESATIVADO${RESET}"
     local proto_info="${TXT_RED}---${RESET}"
     local users_count="0"
@@ -425,14 +391,12 @@ menu_display() {
     users_count=$(db_query "SELECT count(*) FROM xray")
     [ -z "$users_count" ] && users_count="0"
 
-    # Dashboard
     echo "-----------------------------------------"
     echo -e " Estado:    $status_txt"
     echo -e " Clientes:  ${TXT_BLUE}$users_count${RESET}"
     echo -e " Info:      $proto_info"
     echo "-----------------------------------------"
     echo ""
-    # Opções Clean (Ciano/Negrito/Maiúsculo)
     echo -e "${TXT_CYAN}[1]. CRIAR USUÁRIO${RESET}"
     echo -e "${TXT_CYAN}[2]. REMOVER USUÁRIO${RESET}"
     echo -e "${TXT_CYAN}[3]. LISTAR USUÁRIOS${RESET}"
