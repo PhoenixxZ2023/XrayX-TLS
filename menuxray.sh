@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão V3.1 (Correção de Chaves Reality)
+# menuxray.sh - Versão Estável (Vision/XHTTP/WS/gRPC) - Sem Reality
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -14,19 +14,20 @@ KEY_FILE="$SSL_DIR/privkey.pem"
 CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
-REALITY_PUB_FILE="$XRAY_DIR/reality.pub" 
 
+# Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
 
+# Garantir diretórios
 mkdir -p "$XRAY_DIR"
 mkdir -p "$SSL_DIR"
 
-# --- CORES ---
+# --- CORES E VISUAL ---
 BLUE_BOLD='\033[1;34m'
 GREEN='\033[1;32m'
-RED='\033[1;31m'
 RESET='\033[0m'
 
+# Função Header Padrão
 header_blue() {
     clear
     echo -e "${BLUE_BOLD}=========================================${RESET}"
@@ -35,14 +36,23 @@ header_blue() {
     echo ""
 }
 
+# --- FUNÇÕES DE LÓGICA ---
+
 db_query() {
     psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
 }
 
 func_install_official_core() {
     header_blue "INSTALANDO XRAY CORE"
+    echo "Baixando versão oficial..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    if [ $? -eq 0 ]; then echo "✅ Xray Core pronto!"; sleep 1; else echo "❌ Falha no download."; read -rp "Enter..."; fi
+    if [ $? -eq 0 ]; then
+        echo "✅ Xray Core pronto!"
+        sleep 2
+    else
+        echo "❌ Falha ao baixar Xray Core."
+        read -rp "Pressione ENTER para continuar..."
+    fi
 }
 
 func_check_cert() {
@@ -50,15 +60,31 @@ func_check_cert() {
     return 0
 }
 
+func_check_domain_ip() {
+    local domain="$1"
+    local vps_ip=$(curl -s icanhazip.com)
+    if [ -z "$domain" ]; then echo "❌ Domínio vazio."; return 1; fi
+    local domain_ip=$(dig +short "$domain" | head -n 1)
+    if [ -z "$domain_ip" ]; then echo "❌ Erro DNS: Não resolveu '$domain'."; return 1; fi
+    if [ "$domain_ip" != "$vps_ip" ]; then
+        echo "⚠️  AVISO: IP do domínio ($domain_ip) difere do IP da VPS ($vps_ip)."
+        read -rp "Continuar? (s/n): " confirm; [[ "$confirm" != "s" ]] && return 1
+    fi
+    echo "✅ Domínio verificado."
+    return 0
+}
+
 func_xray_cert() {
     local domain="$1"
-    [ -z "$domain" ] && return 1
+    if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
+    
     mkdir -p "$SSL_DIR"
-    echo "Gerando certificado auto-assinado para $domain..."
+    echo "Gerando certificado para $domain..."
     openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
-    chmod 644 "$KEY_FILE" "$CRT_FILE"
+    chmod 755 "$SSL_DIR"; chmod 644 "$KEY_FILE"; chmod 644 "$CRT_FILE"
+    if [ -f "$KEY_FILE" ]; then echo "✅ Certificado OK."; else echo "❌ Falha ao gerar."; return 1; fi
 }
 
 func_generate_config() {
@@ -66,27 +92,14 @@ func_generate_config() {
     local network="$2"
     local domain="$3"
     local api_port="$4"
-    local use_tls="$5"
-    local reality_dest="$6"
-    local reality_names="$7"
-    local reality_private="$8"
-    local reality_shortid="$9"
+    local use_tls="$5" 
     
     mkdir -p "$(dirname "$CONFIG_PATH")"
+    if [ -d "$SSL_DIR" ]; then chmod 755 "$SSL_DIR"; chmod 644 "$SSL_DIR"/* 2>/dev/null; fi
 
     local stream_settings=""
-    local protocol_settings='{clients: [], decryption: "none", fallbacks: []}'
     
-    if [ "$network" == "reality" ]; then
-        protocol_settings=$(jq -n --arg dest "$reality_dest" '{clients: [], decryption: "none", fallbacks: [{dest: $dest, xver: 0}]}')
-        stream_settings=$(jq -n \
-            --arg dest "$reality_dest" \
-            --argjson names "$reality_names" \
-            --arg pk "$reality_private" \
-            --argjson sid "[\"$reality_shortid\"]" \
-            '{network: "tcp", security: "reality", realitySettings: {show: false, dest: $dest, xver: 0, serverNames: $names, privateKey: $pk, shortIds: $sid}, tcpSettings: {header: {type: "none"}}}')
-
-    elif [ "$network" == "xhttp" ]; then
+    if [ "$network" == "xhttp" ]; then
         if [ "$use_tls" = "true" ]; then
             stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network: "xhttp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], alpn: ["h2", "http/1.1"]}, xhttpSettings: {path: "/", scMaxBufferedPosts: 30}}')
         else
@@ -114,13 +127,10 @@ func_generate_config() {
         fi
     fi
 
-    jq -n --argjson stream "$stream_settings" \
-          --argjson proto "$protocol_settings" \
-          --arg port "$port" \
-          --arg api "$api_port" \
-      '{log: {loglevel: "warning"}, api: {services: ["HandlerService", "LoggerService", "StatsService"], tag: "api"}, inbounds: [{tag: "api", port: ($api | tonumber), protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, listen: "127.0.0.1"}, {tag: "inbound-dragoncore", port: ($port | tonumber), protocol: "vless", settings: $proto, streamSettings: $stream}], outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "blocked"}], routing: {domainStrategy: "AsIs", rules: [{type: "field", inboundTag: ["api"], outboundTag: "api"}]}}' > "$CONFIG_PATH"
+    jq -n --argjson stream "$stream_settings" --arg port "$port" --arg api "$api_port" \
+      '{log: {loglevel: "warning"}, api: {services: ["HandlerService", "LoggerService", "StatsService"], tag: "api"}, inbounds: [{tag: "api", port: ($api | tonumber), protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, listen: "127.0.0.1"}, {tag: "inbound-dragoncore", port: ($port | tonumber), protocol: "vless", settings: {clients: [], decryption: "none", fallbacks: []}, streamSettings: $stream}], outbounds: [{protocol: "freedom", tag: "direct"}, {protocol: "blackhole", tag: "blocked"}], routing: {domainStrategy: "AsIs", rules: [{type: "field", inboundTag: ["api"], outboundTag: "api"}]}}' > "$CONFIG_PATH"
 
-    if [ "$network" == "vision" ] || [ "$network" == "reality" ]; then
+    if [ "$network" == "vision" ]; then
         jq '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": "xtls-rprx-vision"}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
 
@@ -129,11 +139,17 @@ func_generate_config() {
     
     header_blue "STATUS DA INSTALAÇÃO"
     if systemctl is-active --quiet xray; then
-        echo -e "${GREEN}✅ Configuração Aplicada!${RESET}"
-        [ "$network" == "reality" ] && echo "   ► Modo: REALITY (Camuflagem: $reality_dest)"
+        echo "✅ Configuração Aplicada com Sucesso!"
+        echo "========================================="
+        echo "📊 Resumo:"
+        echo "   ► Protocolo:  $network"
+        echo "   ► Porta Pub:  $port"
+        echo "   ► Porta Int:  $api_port"
+        echo "   ► TLS Ativo:  $use_tls"
+        echo "   ► Domínio:    $domain"
     else
-        echo -e "${RED}❌ ERRO CRÍTICO: Xray falhou ao iniciar.${RESET}"
-        journalctl -u xray -n 15 --no-pager
+        echo "❌ ERRO CRÍTICO: Xray falhou ao iniciar."
+        journalctl -u xray -n 10 --no-pager
     fi
     echo "========================================="
     read -rp "Pressione ENTER para voltar..."
@@ -148,15 +164,8 @@ func_add_user_logic() {
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
     local sec=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.security' "$CONFIG_PATH")
-    
-    local domain=""
-    if [ "$sec" == "reality" ]; then
-        domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.realitySettings.serverNames[0]' "$CONFIG_PATH")
-    else
-        domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
-    fi
-    local vps_ip=$(curl -s icanhazip.com)
-    if [ -z "$domain" ]; then domain=$vps_ip; fi
+    local domain=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.tlsSettings.serverName // empty' "$CONFIG_PATH")
+    if [ -z "$domain" ]; then domain=$(curl -s icanhazip.com); fi
 
     local uuid=$(uuidgen)
     local expiry=$(date -d "+$expiry_days days" +%F)
@@ -164,28 +173,23 @@ func_add_user_logic() {
     jq --arg uuid "$uuid" --arg nick_arg "$nick" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick_arg, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    if [ "$sec" == "reality" ] || [ "$net" == "vision" ]; then
-         jq --arg uuid "$uuid" \
-           '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients[] | select(.id == $uuid)) += {"flow": "xtls-rprx-vision"}' \
-           "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    fi
 
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
     systemctl restart xray 2>/dev/null
     
+    # --- GERADOR DE LINK ---
     local link=""
-    if [ "$sec" == "reality" ]; then
-        local pbk=$(cat "$REALITY_PUB_FILE")
-        local sid=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.realitySettings.shortIds[0]' "$CONFIG_PATH")
-        link="vless://${uuid}@${vps_ip}:${port}?security=reality&encryption=none&pbk=${pbk}&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=${domain}&sid=${sid}#${nick}"
+    
+    if [ "$net" == "grpc" ]; then
+        local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
+        link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
     elif [ "$net" == "ws" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path' "$CONFIG_PATH")
-        [ "$path" == "/" ] && path="%2F"
+        if [ "$path" == "/" ]; then path="%2F"; fi
         link="vless://${uuid}@${domain}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${domain}#${nick}"
     elif [ "$net" == "xhttp" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path' "$CONFIG_PATH")
-        [ "$path" == "/" ] && path="%2F"
+        if [ "$path" == "/" ]; then path="%2F"; fi
         if [ "$sec" == "tls" ]; then
             link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${domain}#${nick}"
         else
@@ -225,13 +229,15 @@ func_remove_user_logic() {
     echo "✅ Usuário removido com sucesso."
 }
 
+# --- PÁGINAS DO MENU ---
+
 func_page_create_user() {
     while true; do
         header_blue "CRIAR USUÁRIO"
         read -rp "Nome do usuário (0 p/ voltar): " nick
         if [ "$nick" == "0" ] || [ -z "$nick" ]; then break; fi
         check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$nick' LIMIT 1")
-        if [ -n "$check_exists" ]; then echo "❌ ERRO: Usuário já existe!"; read -rp "Enter..."; continue; fi
+        if [ -n "$check_exists" ]; then echo "❌ ERRO: O usuário '$nick' JÁ EXISTE!"; read -rp "Enter..."; continue; fi
         read -rp "Dias de validade (Padrão 30): " days
         [ -z "$days" ] && days=30
         echo ""; func_add_user_logic "$nick" "$days"; echo ""
@@ -241,15 +247,17 @@ func_page_create_user() {
 
 func_page_remove_user() {
     header_blue "REMOVER USUÁRIO"
-    read -rp "Digite o ID ou UUID: " id_input
+    echo "Digite o ID ou UUID do usuário."
+    read -rp "Identificador: " id_input
     if [ -n "$id_input" ]; then func_remove_user_logic "$id_input"; fi
     echo ""; read -rp "Pressione ENTER para voltar..."
 }
 
 func_page_list_users() {
+    if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Xray não configurado."; read -rp "Enter..."; return; fi
     header_blue "LISTAR USUÁRIOS"
     while IFS='|' read -r id nick uuid expiry; do
-        echo "🆔 ID: $id | 👤 $nick | 📅 $expiry | 🔑 $uuid"
+        echo "🆔 ID: $id | 👤 Usuário: $nick | 📅 Expira: $expiry | 🔑 UUID: $uuid"
     done < <(db_query "SELECT id, nick, uuid, expiry FROM xray ORDER BY id")
     echo ""; read -rp "Pressione ENTER para voltar..."
 }
@@ -257,8 +265,9 @@ func_page_list_users() {
 func_page_purge_expired() {
     header_blue "LIMPEZA DE EXPIRADOS"
     local today=$(date +%F)
+    echo "Buscando usuários vencidos antes de $today..."
     local expired_uuids=$(db_query "SELECT uuid FROM xray WHERE expiry < '$today'")
-    if [ -z "$expired_uuids" ]; then echo "✅ Nenhum expirado."; else
+    if [ -z "$expired_uuids" ]; then echo "✅ Nenhum usuário expirado encontrado."; else
         for uuid in $expired_uuids; do func_remove_user_logic "$uuid"; done
         echo "✅ Limpeza concluída."
     fi
@@ -268,31 +277,73 @@ func_page_purge_expired() {
 func_page_uninstall() {
     header_blue "DESINSTALAR SISTEMA"
     echo "⚠️  ATENÇÃO: ISSO APAGARÁ TUDO!"
-    read -rp "Digite 'SIM' para confirmar: " confirm
+    echo " - Xray Core e Configurações"
+    echo " - Banco de Dados e Usuários"
+    echo ""; read -rp "Digite 'SIM' para confirmar: " confirm
     if [ "$confirm" != "SIM" ]; then echo "❌ Cancelado."; return; fi
     systemctl stop xray 2>/dev/null; systemctl disable xray 2>/dev/null
     rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
-    rm -f /etc/systemd/system/xray.service; systemctl daemon-reload
+    rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload
     rm -rf "$XRAY_DIR"; rm -rf "$SSL_DIR"; rm -f /bin/xray-menu
+    (crontab -l | grep -v "func_purge_expired") | crontab -
     sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
     sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" >/dev/null 2>&1
     echo "✅ Desinstalação Completa!"; exit 0
 }
 
+# --- WIZARD DE INSTALAÇÃO (Opção 4) ---
 func_wizard_install() {
-    header_blue "INSTALAÇÃO GUIADA"
+    # PASSO 1
+    header_blue "INSTALAÇÃO GUIADA - PASSO 1/5"
     read -rp "Deseja instalar/atualizar o Xray Core? (s/n): " install_opt
-    [[ "$install_opt" =~ ^[Ss]$ ]] && func_install_official_core
+    if [[ "$install_opt" =~ ^[Ss]$ ]]; then func_install_official_core; fi
 
+    # PASSO 2
+    header_blue "CONFIGURAÇÃO - PASSO 2/5"
+    echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
+    echo "1) SIM - Requer domínio (Recomendado)"
+    echo "2) NÃO - Conexão simples (Pode usar IP)"
+    read -rp "Opção [1/2]: " tls_opt
+    local use_tls="false"
+    if [ "$tls_opt" == "1" ]; then use_tls="true"; fi
+
+    # PASSO 3
+    header_blue "CONFIGURAÇÃO - PASSO 3/5"
+    read -rp "Digite a porta interna do Xray [Padrão 1080]: " api_port
+    if [ -z "$api_port" ]; then api_port="1080"; fi
+
+    # PASSO 4
+    header_blue "CONFIGURAÇÃO - PASSO 4/5"
+    read -rp "Digite a porta de conexão pública (Ex: 443, 80, 8080): " pub_port
+    if [ -z "$pub_port" ]; then pub_port="80"; fi
+
+    # PASSO 5 - Domínio e Protocolo
+    header_blue "CONFIGURAÇÃO - PASSO 5/5"
+    local domain_val=""
+    if [ "$use_tls" == "true" ]; then
+        echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
+        read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
+        if ! func_check_domain_ip "$domain_val"; then return; fi
+        func_xray_cert "$domain_val" 
+        if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
+    else
+        echo "ℹ️  Modo sem TLS. Pode usar IP ou Domínio."
+        read -rp "Digite o Domínio ou IP (Enter para Auto-Detectar): " domain_val
+        if [ -z "$domain_val" ]; then domain_val=$(curl -s icanhazip.com); fi
+    fi
+    echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
+
+    # Seleção de Protocolo (SEMPRE MOSTRA TODOS)
+    sleep 1
     header_blue "SELECIONE O PROTOCOLO"
-    echo "1. ws (WebSocket) - Para Cloudflare"
+    echo "1. ws (WebSocket)"
     echo "2. grpc (gRPC)"
     echo "3. xhttp (HTTP/2)"
     echo "4. tcp (Simples)"
-    echo "5. vision (XTLS-Vision)"
-    echo "6. reality (VLESS Reality) - 🏆 Burlas/SNI Livre"
+    echo "5. vision (XTLS-Vision) - 🚀"
     echo "0. Cancelar"
-    read -rp "Opção: " prot_opt
+    echo ""
+    read -rp "Digite o número da opção: " prot_opt
     
     local selected_net=""
     case "$prot_opt" in
@@ -300,81 +351,42 @@ func_wizard_install() {
         2) selected_net="grpc" ;;
         3) selected_net="xhttp" ;;
         4) selected_net="tcp" ;;
-        5) selected_net="vision" ;;
-        6) selected_net="reality" ;;
-        *) return ;;
+        5) 
+            selected_net="vision"
+            # CORREÇÃO AUTOMÁTICA DE TLS PARA VISION
+            if [ "$use_tls" == "false" ]; then
+                echo ""
+                echo "⚠️  O protocolo Vision EXIGE TLS/SSL."
+                echo "Vamos configurar o domínio e certificado agora."
+                echo ""
+                read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
+                if ! func_check_domain_ip "$domain_val"; then return; fi
+                func_xray_cert "$domain_val"
+                if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
+                use_tls="true" # Força TLS para true
+                echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
+            fi
+            ;;
+        0) return ;;
+        *) echo "❌ Inválido."; sleep 2; return ;;
     esac
 
-    read -rp "Porta Interna [1080]: " api_port; [ -z "$api_port" ] && api_port="1080"
-    read -rp "Porta Pública [443]: " pub_port; [ -z "$pub_port" ] && pub_port="443"
-
-    local use_tls="false"
-    local domain_val=""
-    local reality_dest=""
-    local reality_names=""
-    local reality_private=""
-    local reality_shortid=""
-
-    if [ "$selected_net" == "reality" ]; then
-        header_blue "CONFIGURAÇÃO REALITY"
-        echo "Gerando chaves..."
-        
-        # --- CORREÇÃO DE CHAVES AQUI ---
-        local keys=$($XRAY_BIN x25519)
-        reality_private=$(echo "$keys" | grep "Private" | awk '{print $NF}')
-        local reality_pub=$(echo "$keys" | grep "Public" | awk '{print $NF}')
-        
-        if [ -z "$reality_private" ]; then
-            echo "❌ Erro ao gerar chaves. Tentando método alternativo..."
-            keys=$($XRAY_BIN x25519)
-            reality_private=$(echo "$keys" | head -n 1 | cut -d: -f2 | tr -d ' ')
-            reality_pub=$(echo "$keys" | tail -n 1 | cut -d: -f2 | tr -d ' ')
-        fi
-
-        echo "$reality_pub" > "$REALITY_PUB_FILE"
-        reality_shortid=$(openssl rand -hex 4)
-        
-        echo "Escolha a camuflagem (SNI Destino):"
-        echo "1) www.microsoft.com"
-        echo "2) www.google.com"
-        echo "3) www.amazon.com"
-        read -rp "Opção: " sni_opt
-        case "$sni_opt" in
-            1) reality_dest="www.microsoft.com:443"; reality_names='["www.microsoft.com", "microsoft.com"]' ;;
-            2) reality_dest="www.google.com:443"; reality_names='["www.google.com", "google.com"]' ;;
-            3) reality_dest="www.amazon.com:443"; reality_names='["www.amazon.com"]' ;;
-            *) reality_dest="www.microsoft.com:443"; reality_names='["www.microsoft.com", "microsoft.com"]' ;;
-        esac
-        domain_val=$(echo "$reality_names" | jq -r '.[0]')
-
-    else
-        echo "Usar TLS/SSL? (1=Sim, 2=Não)"
-        read -rp "Opção: " tls_opt
-        if [ "$tls_opt" == "1" ] || [ "$selected_net" == "vision" ]; then
-            use_tls="true"
-            read -rp "Digite seu domínio: " domain_val
-            func_xray_cert "$domain_val"
-        else
-            domain_val=$(curl -s icanhazip.com)
-        fi
-    fi
-
-    echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
-    func_generate_config "$pub_port" "$selected_net" "$domain_val" "$api_port" "$use_tls" \
-        "$reality_dest" "$reality_names" "$reality_private" "$reality_shortid"
+    func_generate_config "$pub_port" "$selected_net" "$domain_val" "$api_port" "$use_tls"
 }
 
-# --- MENU ---
+# --- MENU PRINCIPAL ---
 menu_display() {
     clear
-    echo -e "${BLUE_BOLD}⚡ DRAGONCORE XRAY MANAGER v3.1${RESET}"
+    echo -e "${BLUE_BOLD}⚡ DRAGONCORE XRAY MANAGER${RESET}"
+    echo "-----------------------------------------"
     echo "1. Criar Usuário"
     echo "2. Remover Usuário"
     echo "3. Listar Usuários"
-    echo "4. INSTALAR / RECONFIGURAR"
+    echo "4. Instalar e Configurar Xray (Assistente)"
     echo "5. Limpar Expirados"
-    echo "6. Desinstalar"
+    echo "6. Desinstalar (Completo)"
     echo "0. Sair"
+    echo "-----------------------------------------"
     read -rp "Opção: " choice
 }
 
