@@ -1,11 +1,12 @@
 #!/bin/bash
-# menuxray.sh - Versão Premium UI Final (Visual Unificado + Limpo)
+# menuxray.sh - Versão Premium UI (Auto-Fix Database)
 
-# --- Variáveis de Ambiente ---
-DB_HOST="{DB_HOST}"
-DB_NAME="{DB_NAME}"
-DB_USER="{DB_USER}"
-DB_PASS="{DB_PASS}"
+# --- CONFIGURAÇÃO AUTOMÁTICA ---
+# Mesmo que isso esteja errado, o script vai tentar corrigir sozinho na função db_query
+DB_HOST="localhost"
+DB_NAME="sshplus" # Tentativa padrão
+DB_USER="root"
+DB_PASS="null"
 
 XRAY_BIN="/usr/local/bin/xray"
 CONFIG_PATH="/usr/local/etc/xray/config.json"
@@ -15,50 +16,60 @@ CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
 
-export PGPASSWORD=$DB_PASS
 mkdir -p "$XRAY_DIR"
 mkdir -p "$SSL_DIR"
 
 # --- CORES E VISUAL ---
-# Fundo Branco, Texto Azul (Estilo Faixa)
 TITLE_BAR='\033[1;47;34m'
-# Texto Verde (Sucesso/Ativo)
 TXT_GREEN='\033[1;32m'
-# Texto Vermelho (Erro/Inativo)
 TXT_RED='\033[1;31m'
-# Texto Azul (Informações)
 TXT_BLUE='\033[1;34m'
-# Texto Ciano Negrito (Menu Opções)
 TXT_CYAN='\033[1;36m'
-# Reset
 RESET='\033[0m'
 
-# --- FUNÇÃO HEADER (Corrigida e Padronizada) ---
 header_blue() {
     clear
     echo -e "${TITLE_BAR}   $1   ${RESET}"
     echo ""
 }
 
-# --- FUNÇÕES DE SISTEMA ---
-
+# --- FUNÇÃO DE BANCO DE DADOS INTELIGENTE ---
+# Tenta conectar de várias formas até conseguir
 db_query() {
-    psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
+    local query="$1"
+    local result=""
+    
+    # 1. Tenta método padrão (se as variáveis estiverem certas)
+    result=$(psql -h "localhost" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$query" 2>/dev/null)
+    
+    # 2. Se falhar, tenta via ROOT do Postgres (Bypassa senha) nos bancos comuns
+    if [ -z "$result" ]; then
+        # Tenta banco 'sshplus'
+        result=$(sudo -u postgres psql -d sshplus -t -A -c "$query" 2>/dev/null)
+    fi
+    if [ -z "$result" ]; then
+        # Tenta banco 'dtunnel'
+        result=$(sudo -u postgres psql -d dtunnel -t -A -c "$query" 2>/dev/null)
+    fi
+    if [ -z "$result" ]; then
+        # Tenta banco 'xray'
+        result=$(sudo -u postgres psql -d xray -t -A -c "$query" 2>/dev/null)
+    fi
+    if [ -z "$result" ]; then
+         # Tenta banco 'vpndb'
+        result=$(sudo -u postgres psql -d vpndb -t -A -c "$query" 2>/dev/null)
+    fi
+    
+    echo "$result"
 }
+
+# --- DEMAIS FUNÇÕES ---
 
 func_install_official_core() {
     header_blue "INSTALANDO XRAY CORE"
-    echo "Aguarde, baixando e instalando..."
-    # Instalação silenciosa (Clean)
+    echo "Aguarde..."
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install > /dev/null 2>&1
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${TXT_GREEN}✅ Xray Core instalado com sucesso!${RESET}"
-        sleep 2
-    else
-        echo -e "${TXT_RED}❌ Falha ao baixar Xray Core.${RESET}"
-        read -rp "Enter para continuar..."
-    fi
+    if [ $? -eq 0 ]; then echo -e "${TXT_GREEN}✅ Sucesso!${RESET}"; sleep 1; else echo -e "${TXT_RED}❌ Falha.${RESET}"; sleep 2; fi
 }
 
 func_check_cert() {
@@ -69,29 +80,24 @@ func_check_cert() {
 func_check_domain_ip() {
     local domain="$1"
     local vps_ip=$(curl -s icanhazip.com)
-    if [ -z "$domain" ]; then echo "❌ Domínio vazio."; return 1; fi
+    if [ -z "$domain" ]; then echo "❌ Vazio."; return 1; fi
     local domain_ip=$(dig +short "$domain" | head -n 1)
-    if [ -z "$domain_ip" ]; then echo "❌ Erro DNS: Não resolveu '$domain'."; return 1; fi
+    if [ -z "$domain_ip" ]; then echo "❌ DNS falhou."; return 1; fi
     if [ "$domain_ip" != "$vps_ip" ]; then
-        echo "⚠️  AVISO: IP do domínio ($domain_ip) difere do IP da VPS ($vps_ip)."
+        echo "⚠️  IP do domínio difere da VPS."
         read -rp "Continuar? (s/n): " confirm; [[ "$confirm" != "s" ]] && return 1
     fi
-    echo "✅ Domínio verificado."
     return 0
 }
 
 func_xray_cert() {
     local domain="$1"
-    if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
-    
     mkdir -p "$SSL_DIR"
-    echo "Gerando certificado SSL..."
+    echo "Gerando SSL..."
     openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
         -keyout "$KEY_FILE" -out "$CRT_FILE" > /dev/null 2>&1
-    
     chmod 755 "$SSL_DIR"; chmod 644 "$KEY_FILE"; chmod 644 "$CRT_FILE"
-    if [ -f "$KEY_FILE" ]; then echo "✅ Certificado Gerado."; else echo "❌ Falha ao gerar."; return 1; fi
 }
 
 func_generate_config() {
@@ -102,10 +108,8 @@ func_generate_config() {
     local use_tls="$5" 
     
     mkdir -p "$(dirname "$CONFIG_PATH")"
-    if [ -d "$SSL_DIR" ]; then chmod 755 "$SSL_DIR"; chmod 644 "$SSL_DIR"/* 2>/dev/null; fi
 
     local stream_settings=""
-    
     if [ "$network" == "xhttp" ]; then
         if [ "$use_tls" = "true" ]; then
             stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network: "xhttp", security: "tls", tlsSettings: {serverName: $dom, certificates: [{certificateFile: $crt, keyFile: $key}], alpn: ["h2", "http/1.1"]}, xhttpSettings: {path: "/", scMaxBufferedPosts: 30}}')
@@ -143,15 +147,13 @@ func_generate_config() {
 
     systemctl restart xray > /dev/null 2>&1
     sleep 2
-    
-    # Tela de Sucesso Limpa
     clear
     header_blue "STATUS DA INSTALAÇÃO"
     if systemctl is-active --quiet xray; then
-        echo -e "${TXT_GREEN}✅ Configuração Aplicada com Sucesso!${RESET}"
+        echo -e "${TXT_GREEN}✅ Configuração Aplicada!${RESET}"
     else
-        echo -e "${TXT_RED}❌ ERRO CRÍTICO: Xray falhou ao iniciar.${RESET}"
-        journalctl -u xray -n 10 --no-pager
+        echo -e "${TXT_RED}❌ Falha ao iniciar.${RESET}"
+        journalctl -u xray -n 5 --no-pager
     fi
     echo "========================================="
     read -rp "Pressione ENTER para voltar..."
@@ -173,25 +175,30 @@ func_add_user_logic() {
     local uuid=$(uuidgen)
     local expiry=$(date -d "+$expiry_days days" +%F)
 
+    # Verifica se o banco está respondendo ANTES de prosseguir
+    # Tenta criar tabela se não existir (Opcional, mas seguro)
+    db_query "CREATE TABLE IF NOT EXISTS xray (id SERIAL PRIMARY KEY, uuid TEXT, nick TEXT, expiry DATE, protocol TEXT, domain TEXT);" > /dev/null 2>&1
+
     jq --arg uuid "$uuid" --arg nick_arg "$nick" \
        '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) += [{"id": $uuid, "email": $nick_arg, "level": 0}]' \
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
+    # Tenta inserir
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
+    
     systemctl restart xray > /dev/null 2>&1
     
-    # --- GERADOR DE LINK ---
     local link=""
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
         link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
     elif [ "$net" == "ws" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.wsSettings.path' "$CONFIG_PATH")
-        if [ "$path" == "/" ]; then path="%2F"; fi
+        [ "$path" == "/" ] && path="%2F"
         link="vless://${uuid}@${domain}:${port}?path=${path}&security=${sec}&encryption=none&host=${domain}&type=ws&sni=${domain}#${nick}"
     elif [ "$net" == "xhttp" ]; then
         local path=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.xhttpSettings.path' "$CONFIG_PATH")
-        if [ "$path" == "/" ]; then path="%2F"; fi
+        [ "$path" == "/" ] && path="%2F"
         if [ "$sec" == "tls" ]; then
             link="vless://${uuid}@${domain}:${port}?mode=auto&path=${path}&security=tls&encryption=none&host=${domain}&type=xhttp&sni=${domain}#${nick}"
         else
@@ -208,7 +215,6 @@ func_add_user_logic() {
         fi
     fi
 
-    # Tela de Link Limpa
     clear
     echo -e "${TXT_GREEN}✅ Usuário criado com sucesso!${RESET}"
     echo "-----------------------------------------"
@@ -237,7 +243,7 @@ func_remove_user_logic() {
     sleep 1
 }
 
-# --- PÁGINAS DO MENU ---
+# --- PÁGINAS ---
 
 func_page_create_user() {
     while true; do
@@ -300,12 +306,16 @@ func_page_uninstall() {
         echo "🚀 Iniciando desinstalação..."
         systemctl stop xray > /dev/null 2>&1
         systemctl disable xray > /dev/null 2>&1
-        rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
-        rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload > /dev/null 2>&1
-        rm -rf "$XRAY_DIR"; rm -rf "$SSL_DIR"; rm -f /bin/xray-menu
-        (crontab -l | grep -v "func_purge_expired") | crontab -
+        rm -f /usr/local/bin/xray
+        rm -rf /usr/local/etc/xray
+        rm -rf /usr/local/share/xray
+        rm -f /etc/systemd/system/xray.service
+        rm -f /etc/systemd/system/xray@.service
+        systemctl daemon-reload > /dev/null 2>&1
+        rm -rf "$XRAY_DIR"
+        rm -rf "$SSL_DIR"
+        rm -f /bin/xray-menu
         sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
-        sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" >/dev/null 2>&1
         echo "✅ Desinstalação Completa!"; exit 0
     else
         echo "❌ Operação Cancelada."
