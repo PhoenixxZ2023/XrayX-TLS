@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Premium UI (Visual Ciano/Negrito)
+# menuxray.sh - Versão Premium UI Final (Visual Unificado + Limpo)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -15,37 +15,32 @@ CRT_FILE="$SSL_DIR/fullchain.pem"
 XRAY_DIR="/opt/XrayTools"
 ACTIVE_DOMAIN_FILE="$XRAY_DIR/active_domain"
 
-# Variável de Senha para psql
 export PGPASSWORD=$DB_PASS
-
-# Garantir diretórios
 mkdir -p "$XRAY_DIR"
 mkdir -p "$SSL_DIR"
 
 # --- CORES E VISUAL ---
-# Fundo Branco, Texto Azul Negrito (Título)
+# Fundo Branco, Texto Azul (Estilo Faixa)
 TITLE_BAR='\033[1;47;34m'
-# Texto Verde (Status ON)
+# Texto Verde (Sucesso/Ativo)
 TXT_GREEN='\033[1;32m'
-# Texto Vermelho (Status OFF)
+# Texto Vermelho (Erro/Inativo)
 TXT_RED='\033[1;31m'
 # Texto Azul (Informações)
 TXT_BLUE='\033[1;34m'
-# Texto Ciano Negrito (Menu)
+# Texto Ciano Negrito (Menu Opções)
 TXT_CYAN='\033[1;36m'
 # Reset
 RESET='\033[0m'
 
-# Função Header Padrão (Para sub-menus)
+# --- FUNÇÃO HEADER (Corrigida e Padronizada) ---
 header_blue() {
     clear
-    echo -e "${TXT_BLUE}=========================================${RESET}"
-    echo -e "${TXT_BLUE}   $1${RESET}"
-    echo -e "${TXT_BLUE}=========================================${RESET}"
+    echo -e "${TITLE_BAR}   $1   ${RESET}"
     echo ""
 }
 
-# --- FUNÇÕES DE LÓGICA ---
+# --- FUNÇÕES DE SISTEMA ---
 
 db_query() {
     psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -A -c "$1" 2>/dev/null
@@ -53,14 +48,16 @@ db_query() {
 
 func_install_official_core() {
     header_blue "INSTALANDO XRAY CORE"
-    echo "Baixando versão oficial..."
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    echo "Aguarde, baixando e instalando..."
+    # Instalação silenciosa (Clean)
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install > /dev/null 2>&1
+    
     if [ $? -eq 0 ]; then
-        echo "✅ Xray Core pronto!"
+        echo -e "${TXT_GREEN}✅ Xray Core instalado com sucesso!${RESET}"
         sleep 2
     else
-        echo "❌ Falha ao baixar Xray Core."
-        read -rp "Pressione ENTER para continuar..."
+        echo -e "${TXT_RED}❌ Falha ao baixar Xray Core.${RESET}"
+        read -rp "Enter para continuar..."
     fi
 }
 
@@ -88,12 +85,13 @@ func_xray_cert() {
     if [ -z "$domain" ]; then echo "Erro: Domínio necessário."; return 1; fi
     
     mkdir -p "$SSL_DIR"
-    echo "Gerando certificado para $domain..."
+    echo "Gerando certificado SSL..."
     openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
         -subj "/C=BR/ST=SP/L=SaoPaulo/O=DragonCore/OU=VPN/CN=$domain" \
-        -keyout "$KEY_FILE" -out "$CRT_FILE" 2>/dev/null
+        -keyout "$KEY_FILE" -out "$CRT_FILE" > /dev/null 2>&1
+    
     chmod 755 "$SSL_DIR"; chmod 644 "$KEY_FILE"; chmod 644 "$CRT_FILE"
-    if [ -f "$KEY_FILE" ]; then echo "✅ Certificado OK."; else echo "❌ Falha ao gerar."; return 1; fi
+    if [ -f "$KEY_FILE" ]; then echo "✅ Certificado Gerado."; else echo "❌ Falha ao gerar."; return 1; fi
 }
 
 func_generate_config() {
@@ -143,14 +141,16 @@ func_generate_config() {
         jq '(.inbounds[] | select(.tag == "inbound-dragoncore").settings) += {"flow": "xtls-rprx-vision"}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     fi
 
-    systemctl restart xray
+    systemctl restart xray > /dev/null 2>&1
     sleep 2
     
+    # Tela de Sucesso Limpa
+    clear
     header_blue "STATUS DA INSTALAÇÃO"
     if systemctl is-active --quiet xray; then
-        echo "✅ Configuração Aplicada com Sucesso!"
+        echo -e "${TXT_GREEN}✅ Configuração Aplicada com Sucesso!${RESET}"
     else
-        echo "❌ ERRO CRÍTICO: Xray falhou ao iniciar."
+        echo -e "${TXT_RED}❌ ERRO CRÍTICO: Xray falhou ao iniciar.${RESET}"
         journalctl -u xray -n 10 --no-pager
     fi
     echo "========================================="
@@ -160,8 +160,9 @@ func_generate_config() {
 func_add_user_logic() {
     local nick="$1"
     local expiry_days="$2"
-    if [ -z "$nick" ]; then echo "❌ Erro: Nome vazio."; return 1; fi
-    if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Erro: Xray não configurado."; return 1; fi
+    
+    if [ -z "$nick" ]; then return 1; fi
+    if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Xray não configurado."; return 1; fi
 
     local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH")
     local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH")
@@ -177,7 +178,7 @@ func_add_user_logic() {
        "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
     db_query "INSERT INTO xray (uuid, nick, expiry, protocol, domain) VALUES ('$uuid', '$nick', '$expiry', '$net', '$domain')"
-    systemctl restart xray 2>/dev/null
+    systemctl restart xray > /dev/null 2>&1
     
     # --- GERADOR DE LINK ---
     local link=""
@@ -207,6 +208,8 @@ func_add_user_logic() {
         fi
     fi
 
+    # Tela de Link Limpa
+    clear
     echo -e "${TXT_GREEN}✅ Usuário criado com sucesso!${RESET}"
     echo "-----------------------------------------"
     echo "👤 Usuário: $nick"
@@ -223,11 +226,15 @@ func_remove_user_logic() {
     local uuid=""
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then uuid=$(db_query "SELECT uuid FROM xray WHERE id = $identifier");
     else uuid=$(db_query "SELECT uuid FROM xray WHERE uuid = '$identifier'"); fi
-    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; return 1; fi
+    
+    if [ -z "$uuid" ]; then echo "❌ Usuário não encontrado."; sleep 1; return 1; fi
+    
     jq --arg uuid "$uuid" '(.inbounds[] | select(.tag == "inbound-dragoncore").settings.clients) |= map(select(.id != $uuid))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     db_query "DELETE FROM xray WHERE uuid = '$uuid'"
-    systemctl restart xray 2>/dev/null
-    echo "✅ Usuário removido com sucesso."
+    systemctl restart xray > /dev/null 2>&1
+    
+    echo -e "${TXT_GREEN}✅ Usuário removido com sucesso.${RESET}"
+    sleep 1
 }
 
 # --- PÁGINAS DO MENU ---
@@ -238,10 +245,11 @@ func_page_create_user() {
         read -rp "Nome do usuário (0 p/ voltar): " nick
         if [ "$nick" == "0" ] || [ -z "$nick" ]; then break; fi
         check_exists=$(db_query "SELECT id FROM xray WHERE nick = '$nick' LIMIT 1")
-        if [ -n "$check_exists" ]; then echo "❌ ERRO: O usuário '$nick' JÁ EXISTE!"; read -rp "Enter..."; continue; fi
+        if [ -n "$check_exists" ]; then echo "❌ Usuário já existe!"; sleep 1; continue; fi
         read -rp "Dias de validade (Padrão 30): " days
         [ -z "$days" ] && days=30
-        echo ""; func_add_user_logic "$nick" "$days"; echo ""
+        
+        func_add_user_logic "$nick" "$days"
         read -rp "Pressione ENTER para continuar..."
     done
 }
@@ -251,16 +259,18 @@ func_page_remove_user() {
     echo "Digite o ID ou UUID do usuário."
     read -rp "Identificador: " id_input
     if [ -n "$id_input" ]; then func_remove_user_logic "$id_input"; fi
-    echo ""; read -rp "Pressione ENTER para voltar..."
 }
 
 func_page_list_users() {
     if [ ! -f "$CONFIG_PATH" ]; then echo "❌ Xray não configurado."; read -rp "Enter..."; return; fi
     header_blue "LISTAR USUÁRIOS"
+    echo -e "ID   | USUÁRIO        | VENCIMENTO"
+    echo "----------------------------------"
     while IFS='|' read -r id nick uuid expiry; do
-        echo "🆔 ID: $id | 👤 Usuário: $nick | 📅 Expira: $expiry | 🔑 UUID: $uuid"
+        printf "%-4s | %-14s | %s\n" "$id" "$nick" "$expiry"
     done < <(db_query "SELECT id, nick, uuid, expiry FROM xray ORDER BY id")
-    echo ""; read -rp "Pressione ENTER para voltar..."
+    echo ""
+    read -rp "Pressione ENTER para voltar..."
 }
 
 func_page_purge_expired() {
@@ -268,7 +278,9 @@ func_page_purge_expired() {
     local today=$(date +%F)
     echo "Buscando usuários vencidos antes de $today..."
     local expired_uuids=$(db_query "SELECT uuid FROM xray WHERE expiry < '$today'")
-    if [ -z "$expired_uuids" ]; then echo "✅ Nenhum usuário expirado encontrado."; else
+    if [ -z "$expired_uuids" ]; then 
+        echo "✅ Nenhum usuário expirado encontrado."
+    else
         for uuid in $expired_uuids; do func_remove_user_logic "$uuid"; done
         echo "✅ Limpeza concluída."
     fi
@@ -280,24 +292,36 @@ func_page_uninstall() {
     echo "⚠️  ATENÇÃO: ISSO APAGARÁ TUDO!"
     echo " - Xray Core e Configurações"
     echo " - Banco de Dados e Usuários"
-    echo ""; read -rp "Digite 'SIM' para confirmar: " confirm
-    if [ "$confirm" != "SIM" ]; then echo "❌ Cancelado."; return; fi
-    systemctl stop xray 2>/dev/null; systemctl disable xray 2>/dev/null
-    rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
-    rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload
-    rm -rf "$XRAY_DIR"; rm -rf "$SSL_DIR"; rm -f /bin/xray-menu
-    (crontab -l | grep -v "func_purge_expired") | crontab -
-    sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
-    sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" >/dev/null 2>&1
-    echo "✅ Desinstalação Completa!"; exit 0
+    echo ""
+    
+    read -rp "Deseja realmente desinstalar? [s/n]: " confirm
+    
+    if [[ "$confirm" =~ ^[sS]$ ]]; then
+        echo "🚀 Iniciando desinstalação..."
+        systemctl stop xray > /dev/null 2>&1
+        systemctl disable xray > /dev/null 2>&1
+        rm -f /usr/local/bin/xray; rm -rf /usr/local/etc/xray; rm -rf /usr/local/share/xray
+        rm -f /etc/systemd/system/xray.service; rm -f /etc/systemd/system/xray@.service; systemctl daemon-reload > /dev/null 2>&1
+        rm -rf "$XRAY_DIR"; rm -rf "$SSL_DIR"; rm -f /bin/xray-menu
+        (crontab -l | grep -v "func_purge_expired") | crontab -
+        sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1
+        sudo -u postgres psql -c "DROP USER IF EXISTS $DB_USER;" >/dev/null 2>&1
+        echo "✅ Desinstalação Completa!"; exit 0
+    else
+        echo "❌ Operação Cancelada."
+        sleep 1
+        return
+    fi
 }
 
 func_wizard_install() {
-    header_blue "INSTALAÇÃO GUIADA"
-    # (Conteúdo do Wizard mantido igual, apenas ajustado visualização se necessário)
-    read -rp "Deseja instalar/atualizar o Xray Core? (s/n): " install_opt
+    # PASSO 1
+    header_blue "INSTALAÇÃO GUIADA (1/5)"
+    read -rp "Deseja instalar/atualizar o Xray Core? [s/n]: " install_opt
     if [[ "$install_opt" =~ ^[Ss]$ ]]; then func_install_official_core; fi
 
+    # PASSO 2
+    header_blue "CONFIGURAÇÃO (2/5)"
     echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
     echo "1) SIM - Requer domínio (Recomendado)"
     echo "2) NÃO - Conexão simples (Pode usar IP)"
@@ -305,12 +329,18 @@ func_wizard_install() {
     local use_tls="false"
     if [ "$tls_opt" == "1" ]; then use_tls="true"; fi
 
+    # PASSO 3
+    header_blue "CONFIGURAÇÃO (3/5)"
     read -rp "Digite a porta interna do Xray [Padrão 1080]: " api_port
     if [ -z "$api_port" ]; then api_port="1080"; fi
 
-    read -rp "Digite a porta de conexão pública (Ex: 443, 80, 8080): " pub_port
+    # PASSO 4
+    header_blue "CONFIGURAÇÃO (4/5)"
+    read -rp "Digite a porta de conexão pública (Ex: 443, 80): " pub_port
     if [ -z "$pub_port" ]; then pub_port="80"; fi
 
+    # PASSO 5
+    header_blue "CONFIGURAÇÃO (5/5)"
     local domain_val=""
     if [ "$use_tls" == "true" ]; then
         echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
@@ -344,9 +374,7 @@ func_wizard_install() {
         5) 
             selected_net="vision"
             if [ "$use_tls" == "false" ]; then
-                echo ""
-                echo "⚠️  O protocolo Vision EXIGE TLS/SSL."
-                echo "Vamos configurar o domínio e certificado agora."
+                echo "⚠️  Vision exige TLS. Vamos configurar o domínio."
                 read -rp "Digite seu domínio: " domain_val
                 if ! func_check_domain_ip "$domain_val"; then return; fi
                 func_xray_cert "$domain_val"
@@ -364,7 +392,7 @@ func_wizard_install() {
 # --- MENU PRINCIPAL UI ---
 menu_display() {
     clear
-    # Barra de Título Branca com Texto Azul
+    # Barra de Título (Fundo Branco, Texto Azul)
     echo -e "${TITLE_BAR}        DRAGONCORE XRAY MANAGER        ${RESET}"
     echo ""
 
@@ -373,11 +401,8 @@ menu_display() {
     local proto_info="${TXT_RED}---${RESET}"
     local users_count="0"
     
-    # Verifica se Xray está rodando
     if systemctl is-active --quiet xray; then
         status_txt="${TXT_GREEN}ATIVADO${RESET}"
-        
-        # Leitura da Configuração para Info
         if [ -f "$CONFIG_PATH" ]; then
             local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null)
             local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH" 2>/dev/null)
@@ -387,18 +412,17 @@ menu_display() {
         fi
     fi
     
-    # Contagem de Usuários
     users_count=$(db_query "SELECT count(*) FROM xray")
     [ -z "$users_count" ] && users_count="0"
 
-    # Caixa de Dashboard
+    # Dashboard
     echo "-----------------------------------------"
     echo -e " Estado:    $status_txt"
     echo -e " Clientes:  ${TXT_BLUE}$users_count${RESET}"
     echo -e " Info:      $proto_info"
     echo "-----------------------------------------"
     echo ""
-    # OPÇÕES EM CIANO, NEGRITO E MAIÚSCULAS
+    # Opções Clean (Ciano/Negrito/Maiúsculo)
     echo -e "${TXT_CYAN}[1]. CRIAR USUÁRIO${RESET}"
     echo -e "${TXT_CYAN}[2]. REMOVER USUÁRIO${RESET}"
     echo -e "${TXT_CYAN}[3]. LISTAR USUÁRIOS${RESET}"
@@ -423,4 +447,5 @@ if [ -z "$1" ]; then
             0) exit 0 ;;
         esac
     done
-else "$1" "${@:2}"; fi
+else "$1" "${@:2}"; 
+fi
