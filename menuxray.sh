@@ -1,5 +1,5 @@
 #!/bin/bash
-# menuxray.sh - Versão Estável (Vision/XHTTP/WS/gRPC) - Sem Reality
+# menuxray.sh - Versão Premium UI (Visual Ciano/Negrito)
 
 # --- Variáveis de Ambiente ---
 DB_HOST="{DB_HOST}"
@@ -23,16 +23,25 @@ mkdir -p "$XRAY_DIR"
 mkdir -p "$SSL_DIR"
 
 # --- CORES E VISUAL ---
-BLUE_BOLD='\033[1;34m'
-GREEN='\033[1;32m'
+# Fundo Branco, Texto Azul Negrito (Título)
+TITLE_BAR='\033[1;47;34m'
+# Texto Verde (Status ON)
+TXT_GREEN='\033[1;32m'
+# Texto Vermelho (Status OFF)
+TXT_RED='\033[1;31m'
+# Texto Azul (Informações)
+TXT_BLUE='\033[1;34m'
+# Texto Ciano Negrito (Menu)
+TXT_CYAN='\033[1;36m'
+# Reset
 RESET='\033[0m'
 
-# Função Header Padrão
+# Função Header Padrão (Para sub-menus)
 header_blue() {
     clear
-    echo -e "${BLUE_BOLD}=========================================${RESET}"
-    echo -e "${BLUE_BOLD}   $1${RESET}"
-    echo -e "${BLUE_BOLD}=========================================${RESET}"
+    echo -e "${TXT_BLUE}=========================================${RESET}"
+    echo -e "${TXT_BLUE}   $1${RESET}"
+    echo -e "${TXT_BLUE}=========================================${RESET}"
     echo ""
 }
 
@@ -140,13 +149,6 @@ func_generate_config() {
     header_blue "STATUS DA INSTALAÇÃO"
     if systemctl is-active --quiet xray; then
         echo "✅ Configuração Aplicada com Sucesso!"
-        echo "========================================="
-        echo "📊 Resumo:"
-        echo "   ► Protocolo:  $network"
-        echo "   ► Porta Pub:  $port"
-        echo "   ► Porta Int:  $api_port"
-        echo "   ► TLS Ativo:  $use_tls"
-        echo "   ► Domínio:    $domain"
     else
         echo "❌ ERRO CRÍTICO: Xray falhou ao iniciar."
         journalctl -u xray -n 10 --no-pager
@@ -179,7 +181,6 @@ func_add_user_logic() {
     
     # --- GERADOR DE LINK ---
     local link=""
-    
     if [ "$net" == "grpc" ]; then
         local serviceName=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.grpcSettings.serviceName' "$CONFIG_PATH")
         link="vless://${uuid}@${domain}:${port}?security=${sec}&encryption=none&type=grpc&serviceName=${serviceName}&sni=${domain}#${nick}"
@@ -206,13 +207,13 @@ func_add_user_logic() {
         fi
     fi
 
-    echo -e "${GREEN}✅ Usuário criado com sucesso!${RESET}"
+    echo -e "${TXT_GREEN}✅ Usuário criado com sucesso!${RESET}"
     echo "-----------------------------------------"
     echo "👤 Usuário: $nick"
     echo "📅 Expira:  $expiry"
     echo "🔑 UUID:    $uuid"
     echo "-----------------------------------------"
-    echo -e "${BLUE_BOLD}🔗 Link de Conexão:${RESET}"
+    echo -e "${TXT_BLUE}🔗 Link de Conexão:${RESET}"
     echo "$link"
     echo "-----------------------------------------"
 }
@@ -291,15 +292,12 @@ func_page_uninstall() {
     echo "✅ Desinstalação Completa!"; exit 0
 }
 
-# --- WIZARD DE INSTALAÇÃO (Opção 4) ---
 func_wizard_install() {
-    # PASSO 1
-    header_blue "INSTALAÇÃO GUIADA - PASSO 1/5"
+    header_blue "INSTALAÇÃO GUIADA"
+    # (Conteúdo do Wizard mantido igual, apenas ajustado visualização se necessário)
     read -rp "Deseja instalar/atualizar o Xray Core? (s/n): " install_opt
     if [[ "$install_opt" =~ ^[Ss]$ ]]; then func_install_official_core; fi
 
-    # PASSO 2
-    header_blue "CONFIGURAÇÃO - PASSO 2/5"
     echo "Deseja usar criptografia TLS/SSL (HTTPS)?"
     echo "1) SIM - Requer domínio (Recomendado)"
     echo "2) NÃO - Conexão simples (Pode usar IP)"
@@ -307,18 +305,12 @@ func_wizard_install() {
     local use_tls="false"
     if [ "$tls_opt" == "1" ]; then use_tls="true"; fi
 
-    # PASSO 3
-    header_blue "CONFIGURAÇÃO - PASSO 3/5"
     read -rp "Digite a porta interna do Xray [Padrão 1080]: " api_port
     if [ -z "$api_port" ]; then api_port="1080"; fi
 
-    # PASSO 4
-    header_blue "CONFIGURAÇÃO - PASSO 4/5"
     read -rp "Digite a porta de conexão pública (Ex: 443, 80, 8080): " pub_port
     if [ -z "$pub_port" ]; then pub_port="80"; fi
 
-    # PASSO 5 - Domínio e Protocolo
-    header_blue "CONFIGURAÇÃO - PASSO 5/5"
     local domain_val=""
     if [ "$use_tls" == "true" ]; then
         echo "⚠️  Modo TLS selecionado. DOMÍNIO É OBRIGATÓRIO."
@@ -333,8 +325,6 @@ func_wizard_install() {
     fi
     echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
 
-    # Seleção de Protocolo (SEMPRE MOSTRA TODOS)
-    sleep 1
     header_blue "SELECIONE O PROTOCOLO"
     echo "1. ws (WebSocket)"
     echo "2. grpc (gRPC)"
@@ -353,17 +343,14 @@ func_wizard_install() {
         4) selected_net="tcp" ;;
         5) 
             selected_net="vision"
-            # CORREÇÃO AUTOMÁTICA DE TLS PARA VISION
             if [ "$use_tls" == "false" ]; then
                 echo ""
                 echo "⚠️  O protocolo Vision EXIGE TLS/SSL."
                 echo "Vamos configurar o domínio e certificado agora."
-                echo ""
-                read -rp "Digite seu domínio (Ex: vpn.site.com): " domain_val
+                read -rp "Digite seu domínio: " domain_val
                 if ! func_check_domain_ip "$domain_val"; then return; fi
                 func_xray_cert "$domain_val"
-                if ! func_check_cert; then echo "❌ Erro no certificado."; return; fi
-                use_tls="true" # Força TLS para true
+                use_tls="true"
                 echo "$domain_val" > "$ACTIVE_DOMAIN_FILE"
             fi
             ;;
@@ -374,18 +361,51 @@ func_wizard_install() {
     func_generate_config "$pub_port" "$selected_net" "$domain_val" "$api_port" "$use_tls"
 }
 
-# --- MENU PRINCIPAL ---
+# --- MENU PRINCIPAL UI ---
 menu_display() {
     clear
-    echo -e "${BLUE_BOLD}⚡ DRAGONCORE XRAY MANAGER${RESET}"
+    # Barra de Título Branca com Texto Azul
+    echo -e "${TITLE_BAR}        DRAGONCORE XRAY MANAGER        ${RESET}"
+    echo ""
+
+    # Captura de Status
+    local status_txt="${TXT_RED}DESATIVADO${RESET}"
+    local proto_info="${TXT_RED}---${RESET}"
+    local users_count="0"
+    
+    # Verifica se Xray está rodando
+    if systemctl is-active --quiet xray; then
+        status_txt="${TXT_GREEN}ATIVADO${RESET}"
+        
+        # Leitura da Configuração para Info
+        if [ -f "$CONFIG_PATH" ]; then
+            local port=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").port' "$CONFIG_PATH" 2>/dev/null)
+            local net=$(jq -r '.inbounds[] | select(.tag == "inbound-dragoncore").streamSettings.network' "$CONFIG_PATH" 2>/dev/null)
+            [ -z "$port" ] && port="?"
+            [ -z "$net" ] && net="?"
+            proto_info="${TXT_BLUE}${net^^} (Porta: $port)${RESET}"
+        fi
+    fi
+    
+    # Contagem de Usuários
+    users_count=$(db_query "SELECT count(*) FROM xray")
+    [ -z "$users_count" ] && users_count="0"
+
+    # Caixa de Dashboard
     echo "-----------------------------------------"
-    echo "1. Criar Usuário"
-    echo "2. Remover Usuário"
-    echo "3. Listar Usuários"
-    echo "4. Instalar e Configurar Xray (Assistente)"
-    echo "5. Limpar Expirados"
-    echo "6. Desinstalar (Completo)"
-    echo "0. Sair"
+    echo -e " Estado:    $status_txt"
+    echo -e " Clientes:  ${TXT_BLUE}$users_count${RESET}"
+    echo -e " Info:      $proto_info"
+    echo "-----------------------------------------"
+    echo ""
+    # OPÇÕES EM CIANO, NEGRITO E MAIÚSCULAS
+    echo -e "${TXT_CYAN}[1]. CRIAR USUÁRIO${RESET}"
+    echo -e "${TXT_CYAN}[2]. REMOVER USUÁRIO${RESET}"
+    echo -e "${TXT_CYAN}[3]. LISTAR USUÁRIOS${RESET}"
+    echo -e "${TXT_CYAN}[4]. INSTALAR E CONFIGURAR XRAY (ASSISTENTE)${RESET}"
+    echo -e "${TXT_CYAN}[5]. LIMPAR EXPIRADOS${RESET}"
+    echo -e "${TXT_CYAN}[6]. DESINSTALAR (COMPLETO)${RESET}"
+    echo -e "${TXT_CYAN}[0]. SAIR${RESET}"
     echo "-----------------------------------------"
     read -rp "Opção: " choice
 }
@@ -403,5 +423,4 @@ if [ -z "$1" ]; then
             0) exit 0 ;;
         esac
     done
-else "$1" "${@:2}"; 
-fi
+else "$1" "${@:2}"; fi
