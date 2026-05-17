@@ -3,10 +3,9 @@ import json
 import uuid
 import logging
 import subprocess
-import asyncio
 import re
-import urllib.request
 from datetime import datetime, timedelta
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, ConversationHandler,
@@ -14,96 +13,137 @@ from telegram.ext import (
 )
 import io
 
-# --- CONFIGURACAO VIA VARIAVEIS DE AMBIENTE ---
-# Lido do EnvironmentFile=/opt/XrayTools/.bot_env no systemd
-_token = os.environ.get("BOT_TOKEN", "")
-_admin = os.environ.get("ADMIN_ID", "")
-if not _token or not _admin:
-    raise EnvironmentError(
-        "BOT_TOKEN e ADMIN_ID devem estar definidos.\n"
-        "Verifique /opt/XrayTools/.bot_env e EnvironmentFile= no botxray.service."
-    )
-BOT_TOKEN = _token
-try:
-    ADMIN_ID = int(_admin)
-except ValueError:
-    raise EnvironmentError(f"ADMIN_ID deve ser inteiro, obtido: '{_admin}'")
+# --- CONFIGURAÇÃO (SERÁ SUBSTITUÍDA PELO INSTALADOR) ---
+BOT_TOKEN = "SEU_TOKEN_AQUI"
+ADMIN_ID = 123456789
 
 CONFIG_PATH = "/usr/local/etc/xray/config.json"
 USER_DB = "/opt/XrayTools/users.db"
 XRAY_SERVICE = "xray"
 
+# Scripts chamados via sudo (NOPASSWD em /etc/sudoers.d/botxray)
+SCRIPTS = {
+    "create": "/usr/local/bin/add_user.sh",
+    "delete": "/usr/local/bin/remover_user.sh",
+    "block":  "/usr/local/bin/block_user.sh",
+    "unblock":"/usr/local/bin/unblock_user.sh",
+    "backup": "/usr/local/bin/backup_bot.sh",
+    "restore": "/usr/local/bin/restore_bot.sh",
+}
+
+# Limites do RESTORE (segurança)
+MAX_RESTORE_MB = 50  # ajuste se precisar (50MB)
+ALLOWED_EXT = (".tar.gz",)
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-(SELECTING_ACTION, GET_USERNAME_CREATE, GET_EXPIRY_DAYS_CREATE, GET_USER_TO_DELETE, GET_USER_TO_BLOCK, GET_USER_TO_UNBLOCK) = range(6)
+(
+    SELECTING_ACTION,
+    GET_USERNAME_CREATE,
+    GET_EXPIRY_DAYS_CREATE,
+    GET_USER_TO_DELETE,
+    GET_USER_TO_BLOCK,
+    GET_USER_TO_UNBLOCK,
+    WAIT_RESTORE_FILE
+) = range(7)
 
-# --- FUNCOES DE SISTEMA ---
-
-def restart_xray():
-    subprocess.run(["systemctl", "restart", XRAY_SERVICE], check=False)
+# --- FUNÇÕES DE SISTEMA (leitura apenas) ---
 
 def load_config():
-    if not os.path.exists(CONFIG_PATH): return None
-    try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON corrompido: {e}")
+    if not os.path.exists(CONFIG_PATH):
         return None
-
-def save_config(data):
-    # Salva diretamente e aplica permissao correta para Xray (nobody) ler
-    try:
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-        # nobody:nogroup 0644 — Xray (User=nobody) consegue ler
-        os.chmod(CONFIG_PATH, 0o644)
-        try:
-            import pwd, grp
-            uid = pwd.getpwnam("nobody").pw_uid
-            gid = grp.getgrnam("nogroup").gr_gid
-            os.chown(CONFIG_PATH, uid, gid)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error(f"Erro fatal ao salvar config: {e}")
+    with open(CONFIG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+        return json.load(f)
 
 def get_ip():
     try:
-        with urllib.request.urlopen('https://ifconfig.me', timeout=3) as response:
-            return response.read().decode('utf-8').strip()
-    except Exception as e:
-        logger.error(f"Erro ao obter IP: {e}")
+        return subprocess.check_output(["curl", "-s", "ifconfig.me"], timeout=5).decode().strip()
+    except Exception:
         return "127.0.0.1"
 
-# --- GERADOR DE LINKS ---
-def generate_link(client_uuid, client_email):
+# --- EXECUÇÃO DE SCRIPTS VIA SUDO ---
+
+def run_script(path: str, input_text: str = "", timeout: int = 180) -> tuple[int, str]:
+    """
+    Executa script via sudo (sem senha) com stdin controlado.
+    Retorna (exit_code, stdout+stderr).
+    """
+    try:
+        p = subprocess.run(
+            ["sudo", "-n", "bash", path],
+            input=input_text.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout
+        )
+        out = p.stdout.decode("utf-8", errors="ignore")
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        return 124, "⏱️ Timeout executando o script."
+    except Exception as e:
+        return 1, f"Erro ao executar script: {e}"
+
+def run_script_args(path: str, args: list[str], timeout: int = 300) -> tuple[int, str]:
+    """
+    Executa script via sudo com args (sem stdin).
+    """
+    try:
+        p = subprocess.run(
+            ["sudo", "-n", "bash", path] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=timeout
+        )
+        out = p.stdout.decode("utf-8", errors="ignore")
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        return 124, "⏱️ Timeout executando o script."
+    except Exception as e:
+        return 1, f"Erro ao executar script: {e}"
+
+# --- GERADOR DE LINKS (baseado no config atual) ---
+
+def generate_link(client_uuid: str | None, client_email: str) -> str:
     try:
         data = load_config()
-        if not data: return "Erro ao ler config."
-        
-        inbound = next((i for i in data['inbounds'] if i.get('tag') == 'inbound-dragoncore'), data['inbounds'][0])
-        
-        port = inbound['port']
-        stream = inbound['streamSettings']
-        network = stream['network']
-        security = stream['security']
-        
+        if not data:
+            return "Erro ao ler config."
+
+        inbound = next((i for i in data.get('inbounds', []) if i.get('tag') == 'inbound-dragoncore'), None)
+        if not inbound:
+            return "Erro: inbound-dragoncore não encontrado."
+
+        port = inbound.get('port')
+        stream = inbound.get('streamSettings', {})
+        network = stream.get('network', 'tcp')
+        security = stream.get('security', 'none')
+
         host = ""
         sni = ""
-        
+
         if security == 'tls':
             tls = stream.get('tlsSettings', {})
-            sni = tls.get('serverName', "")
+            sni = tls.get('serverName', "") or ""
             host = sni
-        
+
         if not host:
             host = get_ip()
-            sni = "" 
+            sni = ""
+
+        # Se UUID não foi fornecido, tenta extrair do config por email
+        if not client_uuid:
+            clients = inbound.get('settings', {}).get('clients', [])
+            for c in clients:
+                if c.get('email') == client_email:
+                    client_uuid = c.get('id')
+                    break
+        if not client_uuid:
+            return "UUID não encontrado para gerar link."
 
         link = ""
-        
         if network == "tcp":
             settings = inbound.get('settings', {})
             flow = settings.get('flow', "")
@@ -114,178 +154,112 @@ def generate_link(client_uuid, client_email):
                 link = f"vless://{client_uuid}@{host}:{port}?{sec_param}&encryption=none&type=tcp&headerType=none&sni={sni}#{client_email}"
 
         elif network == "ws":
-            path = stream['wsSettings'].get('path', '/')
+            ws = stream.get('wsSettings', {})
+            path = ws.get('path', '/')
             sec_param = "security=tls" if security == "tls" else "security=none"
             ws_host = sni if sni else host
             link = f"vless://{client_uuid}@{host}:{port}?{sec_param}&encryption=none&type=ws&host={ws_host}&path={path}&sni={sni}#{client_email}"
 
         elif network == "grpc":
-            service = stream['grpcSettings'].get('serviceName', 'gRPC')
+            grpc = stream.get('grpcSettings', {})
+            service = grpc.get('serviceName', 'gRPC')
             sec_param = "security=tls" if security == "tls" else "security=none"
             link = f"vless://{client_uuid}@{host}:{port}?{sec_param}&encryption=none&type=grpc&serviceName={service}&sni={sni}#{client_email}"
 
         elif network == "xhttp":
-            path = stream['xhttpSettings'].get('path', '/')
+            xh = stream.get('xhttpSettings', {})
+            path = xh.get('path', '/')
             sec_param = "security=tls" if security == "tls" else "security=none"
             link = f"vless://{client_uuid}@{host}:{port}?mode=auto&{sec_param}&encryption=none&type=xhttp&host={host}&path={path}&sni={sni}#{client_email}"
 
+        else:
+            sec_param = "security=tls" if security == "tls" else "security=none"
+            link = f"vless://{client_uuid}@{host}:{port}?{sec_param}&encryption=none&type={network}&sni={sni}#{client_email}"
+
         return link
+
     except Exception as e:
         return f"Erro Link: {str(e)}"
 
-# --- FUNCOES CORE ---
+# --- FUNÇÕES CORE (via scripts) ---
 
-def core_create_user(nick, days):
-    if os.path.exists(USER_DB):
-        with open(USER_DB, 'r') as f:
-            if f"{nick}|" in f.read(): return False, "❌ Usuário já existe!"
-    else:
-        open(USER_DB, 'a').close()
-    
-    user_uuid = str(uuid.uuid4())
-    expiry_date = (datetime.now() + timedelta(days=int(days))).strftime('%Y-%m-%d')
-    data = load_config()
-    
-    if not data: return False, "❌ Erro ao ler config.json"
-
-    inbounds = data.get('inbounds', [])
-    target = next((i for i in inbounds if i.get('tag') == 'inbound-dragoncore'), None)
-    
-    if target:
-        target['settings']['clients'].append({"id": user_uuid, "email": nick, "level": 0})
-        save_config(data)
-        
-        with open(USER_DB, 'a') as f:
-            f.write(f"{nick}|{user_uuid}|{expiry_date}\n")
-        
-        restart_xray()
-        
-        link = generate_link(user_uuid, nick)
-        
-        return True, f"✅ *Usuário Criado!*\n\n👤 `{nick}`\n📅 `{expiry_date}`\n\n🔗 *Link VLESS:*\n`{link}`"
-    return False, "❌ Inbound não encontrado."
-
-def core_delete_user(nick):
-    data = load_config()
-    found = False
-    
-    if data:
-        inbounds = data.get('inbounds', [])
-        for inbound in inbounds:
-            if inbound.get('tag') == 'inbound-dragoncore':
-                clients = inbound['settings']['clients']
-                new_clients = [c for c in clients if c.get('email') != nick and c.get('email') != f"LOCKED_{nick}"]
-                if len(clients) != len(new_clients): found = True
-                inbound['settings']['clients'] = new_clients
-        save_config(data)
-    
-    if os.path.exists(USER_DB):
-        with open(USER_DB, 'r') as f: lines = f.readlines()
-        with open(USER_DB, 'w') as f:
-            for line in lines:
-                if not line.startswith(f"{nick}|"):
-                    f.write(line)
-                else:
-                    found = True
-
-    if not found:
-        return "❌ Usuário não encontrado no sistema."
-
-    restart_xray()
-    return "✅ Usuário removido do sistema."
-
-def core_block_user(nick):
-    data = load_config()
-    if not data: return "❌ Erro config."
-
-    found = False
-    inbounds = data.get('inbounds', [])
-    for inbound in inbounds:
-        if inbound.get('tag') == 'inbound-dragoncore':
-            for client in inbound['settings']['clients']:
-                if client.get('email') == f"LOCKED_{nick}":
-                    return "⚠️ Usuário já está bloqueado."
-                if client.get('email') == nick:
-                    client['email'] = f"LOCKED_{nick}"
-                    client['id'] = str(uuid.uuid4())
-                    found = True
-                    break
-    
-    if found:
-        save_config(data)
-        restart_xray()
-        return f"⛔ Usuário `{nick}` foi SUSPENSO."
-    else:
-        return "❌ Usuário não encontrado no Config."
-
-def core_unblock_user(nick):
-    real_uuid = None
-    if os.path.exists(USER_DB):
-        with open(USER_DB, 'r') as f:
+def read_uuid_from_db(nick: str) -> str | None:
+    try:
+        if not os.path.exists(USER_DB):
+            return None
+        with open(USER_DB, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.startswith(f"{nick}|"):
-                    parts = line.strip().split('|')
-                    real_uuid = parts[1]
-                    break
-    
-    if not real_uuid: return "❌ Erro: UUID original não encontrado no Backup (DB)."
+                    parts = line.strip().split("|")
+                    if len(parts) >= 2:
+                        return parts[1]
+        return None
+    except Exception:
+        return None
 
-    data = load_config()
-    found = False
-    inbounds = data.get('inbounds', [])
-    for inbound in inbounds:
-        if inbound.get('tag') == 'inbound-dragoncore':
-            for client in inbound['settings']['clients']:
-                if client.get('email') == f"LOCKED_{nick}":
-                    client['email'] = nick
-                    client['id'] = real_uuid
-                    found = True
-                    break
-    
-    if found:
-        save_config(data)
-        restart_xray()
-        return f"✅ Usuário `{nick}` REATIVADO com sucesso."
-    else:
-        return "❌ Usuário não estava bloqueado no sistema."
+def core_create_user(nick, days):
+    # add_user.sh: Nome -> Dias -> Enter
+    code, out = run_script(SCRIPTS["create"], f"{nick}\n{days}\n\n", timeout=120)
+    if code == 0:
+        user_uuid = read_uuid_from_db(nick)
+        link = generate_link(user_uuid, nick)
+        expiry = (datetime.now() + timedelta(days=int(days))).strftime('%Y-%m-%d')
+        return True, f"✅ *Usuário Criado!*\n\n👤 `{nick}`\n📅 `{expiry}`\n\n🔗 *Link VLESS:*\n`{link}`"
+    return False, f"❌ Falha ao criar usuário.\n\n```\n{out[-1500:]}\n```"
+
+def core_delete_user(nick):
+    code, out = run_script(SCRIPTS["delete"], f"{nick}\n", timeout=60)
+    if code == 0:
+        return f"✅ Usuário removido.\n\n```\n{out[-1200:]}\n```"
+    return f"❌ Falha ao remover.\n\n```\n{out[-1200:]}\n```"
+
+def core_block_user(nick):
+    code, out = run_script(SCRIPTS["block"], f"{nick}\n", timeout=60)
+    if code == 0:
+        return f"⛔ Usuário `{nick}` SUSPENSO.\n\n```\n{out[-1200:]}\n```"
+    return f"❌ Falha ao suspender.\n\n```\n{out[-1200:]}\n```"
+
+def core_unblock_user(nick):
+    code, out = run_script(SCRIPTS["unblock"], f"{nick}\n", timeout=60)
+    if code == 0:
+        return f"✅ Usuário `{nick}` REATIVADO.\n\n```\n{out[-1200:]}\n```"
+    return f"❌ Falha ao reativar.\n\n```\n{out[-1200:]}\n```"
 
 def core_list_users_text():
-    if not os.path.exists(USER_DB): return "Nenhum usuário cadastrado."
-    
+    if not os.path.exists(USER_DB):
+        return "Nenhum usuário cadastrado."
+
+    locked_users = set()
     data = load_config()
-    locked_users = []
     if data:
         inbounds = data.get('inbounds', [])
         target = next((i for i in inbounds if i.get('tag') == 'inbound-dragoncore'), None)
         if target:
-            for c in target['settings']['clients']:
+            for c in target.get('settings', {}).get('clients', []):
                 email = c.get('email', '')
-                if email.startswith("LOCKED_"):
-                    locked_users.append(email.replace("LOCKED_", ""))
+                if isinstance(email, str) and email.startswith("LOCKED_"):
+                    locked_users.add(email.replace("LOCKED_", ""))
 
     msg = "LISTA DE USUÁRIOS - DRAGONCORE\n"
     msg += "=================================================================================\n"
     msg += "NOME            | VENCIMENTO  | UUID                                     | STATUS\n"
     msg += "=================================================================================\n"
 
-    with open(USER_DB, 'r') as f:
+    with open(USER_DB, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             parts = line.strip().split('|')
             if len(parts) >= 3:
                 nick = parts[0]
                 uuid_real = parts[1]
                 expiry = parts[2]
-                status = "✅"
-                if nick in locked_users:
-                    status = "⛔️"
+                status = "⛔️" if nick in locked_users else "✅"
                 msg += f"{nick:<15} | {expiry:<11} | {uuid_real:<36} | {status}\n"
     return msg
 
-# --- FUNCOES DO TELEGRAM ---
+# --- FUNÇÕES DO TELEGRAM ---
 
 def is_admin(update: Update) -> bool:
-    if update.effective_user.id != ADMIN_ID: return False
-    return True
+    return update.effective_user and update.effective_user.id == ADMIN_ID
 
 def build_menu():
     keyboard = [
@@ -295,42 +269,54 @@ def build_menu():
          InlineKeyboardButton("✅ REATIVAR", callback_data='unblock_start')],
         [InlineKeyboardButton("📋 LISTAR (TXT)", callback_data='list_users'),
          InlineKeyboardButton("📥 BACKUP", callback_data='backup_start')],
-        [InlineKeyboardButton("❌ SAIR", callback_data='cancel')]
+        [InlineKeyboardButton("♻️ RESTORE", callback_data='restore_start'),
+         InlineKeyboardButton("❌ SAIR", callback_data='cancel')]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
+    if not is_admin(update):
+        return
     context.user_data.clear()
-    await update.message.reply_text("🐉 *PAINEL DRAGONCORE V7.7*", reply_markup=build_menu(), parse_mode='Markdown')
+    await update.message.reply_text("🐉 *PAINEL DRAGONCORE V7.8*", reply_markup=build_menu(), parse_mode='Markdown')
     return SELECTING_ACTION
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
+    if not is_admin(update):
+        return
 
     query = update.callback_query
     await query.answer()
-    
+
     if query.data == 'close_file':
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         return SELECTING_ACTION
 
     if query.data == 'cancel':
-        await query.edit_message_text("Painel Fechado.", reply_markup=None); return ConversationHandler.END
-    
+        await query.edit_message_text("Painel Fechado.", reply_markup=None)
+        return ConversationHandler.END
+
     if query.data == 'create_start':
-        await query.edit_message_text("Nome do usuário (5-9 letras/num):", parse_mode='Markdown'); return GET_USERNAME_CREATE
+        await query.edit_message_text("Nome do usuário (5-9 letras/num):", parse_mode='Markdown')
+        return GET_USERNAME_CREATE
     elif query.data == 'delete_start':
-        await query.edit_message_text("Nome para remover:", parse_mode='Markdown'); return GET_USER_TO_DELETE
+        await query.edit_message_text("Nome para remover:", parse_mode='Markdown')
+        return GET_USER_TO_DELETE
     elif query.data == 'block_start':
-        await query.edit_message_text("Nome para ⛔ SUSPENDER:", parse_mode='Markdown'); return GET_USER_TO_BLOCK
+        await query.edit_message_text("Nome para ⛔ SUSPENDER:", parse_mode='Markdown')
+        return GET_USER_TO_BLOCK
     elif query.data == 'unblock_start':
-        await query.edit_message_text("Nome para ✅ REATIVAR:", parse_mode='Markdown'); return GET_USER_TO_UNBLOCK
-    
+        await query.edit_message_text("Nome para ✅ REATIVAR:", parse_mode='Markdown')
+        return GET_USER_TO_UNBLOCK
+
     elif query.data == 'list_users':
         report = core_list_users_text()
         f = io.BytesIO(report.encode('utf-8'))
         f.name = "usuarios.txt"
+
         close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Fechar Lista", callback_data='close_file')]])
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
@@ -339,66 +325,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown',
             reply_markup=close_btn
         )
+
         await query.edit_message_text(
             "✅ *Lista enviada abaixo!*\nVerifique o arquivo ou escolha outra opção:",
             parse_mode='Markdown',
             reply_markup=build_menu()
         )
         return SELECTING_ACTION
-        
+
     elif query.data == 'backup_start':
         await query.edit_message_text("📦 Gerando Backup...", parse_mode='Markdown')
-        
-        date_str = datetime.now().strftime('%Y%m%d_%H%M')
-        bkp_file = f"/tmp/backup_{date_str}.tar.gz"
 
-        # Copia apenas arquivos essenciais para tmpdir (exclui venv, .py, backups)
-        import tempfile, shutil
-        tmpdir = tempfile.mkdtemp()
-        try:
-            # DBs e dados do XrayTools
-            os.makedirs(f"{tmpdir}/opt/XrayTools", exist_ok=True)
-            for fname in ["users.db", "limits.db", "usage.db", "session.db", "active_domain"]:
-                src = f"/opt/XrayTools/{fname}"
-                if os.path.exists(src):
-                    shutil.copy2(src, f"{tmpdir}/opt/XrayTools/{fname}")
-
-            # Config do Xray
-            if os.path.isdir("/usr/local/etc/xray"):
-                shutil.copytree("/usr/local/etc/xray", f"{tmpdir}/usr/local/etc/xray",
-                                dirs_exist_ok=True)
-
-            # Certificados SSL
-            if os.path.isdir("/opt/DragonCoreSSL"):
-                shutil.copytree("/opt/DragonCoreSSL", f"{tmpdir}/opt/DragonCoreSSL",
-                                dirs_exist_ok=True)
-
-            # Compacta sem shell=True
-            result = subprocess.run(
-                ["tar", "-czf", bkp_file, "-C", tmpdir, "."],
-                check=False, capture_output=True
+        code, out = run_script(SCRIPTS["backup"], "", timeout=180)
+        if code != 0:
+            await query.edit_message_text(
+                f"❌ Falha ao criar backup.\n\n```\n{out[-1200:]}\n```",
+                reply_markup=build_menu(),
+                parse_mode='Markdown'
             )
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        
-        if os.path.exists(bkp_file) and os.path.getsize(bkp_file) > 0:
-            with open(bkp_file, 'rb') as f:
-                close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Fechar Backup", callback_data='close_file')]])
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id, 
-                    document=f, 
-                    filename=os.path.basename(bkp_file),
-                    caption="🔐 *Backup do Sistema*\n\n_Inclui Xray, Banco de Dados e SSL_",
-                    parse_mode='Markdown',
-                    reply_markup=close_btn
-                )
+            return SELECTING_ACTION
+
+        bkp_file = out.strip().splitlines()[-1].strip()
+        if not os.path.exists(bkp_file):
+            await query.edit_message_text("❌ Backup não encontrado após criação.", reply_markup=build_menu())
+            return SELECTING_ACTION
+
+        close_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Fechar Backup", callback_data='close_file')]])
+        with open(bkp_file, 'rb') as fobj:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=fobj,
+                filename=os.path.basename(bkp_file),
+                caption="🔐 *Backup do Sistema* (inclui SSL)",
+                parse_mode='Markdown',
+                reply_markup=close_btn
+            )
+
+        try:
             os.remove(bkp_file)
-            await query.edit_message_text("✅ *Backup enviado abaixo!*", parse_mode='Markdown', reply_markup=build_menu())
-        else:
-            await query.edit_message_text("❌ Falha ao criar backup. Verifique os logs.", reply_markup=build_menu())
+        except Exception:
+            pass
+
+        await query.edit_message_text("✅ *Backup enviado abaixo!*", parse_mode='Markdown', reply_markup=build_menu())
         return SELECTING_ACTION
-    
-    await query.edit_message_text("Reiniciando...", reply_markup=build_menu())
+
+    elif query.data == 'restore_start':
+        warn = (
+            "♻️ *RESTORE*\n\n"
+            "Envie agora o arquivo `backup_dragoncore_XXXX.tar.gz`.\n"
+            f"• Somente `.tar.gz`\n"
+            f"• Máx: {MAX_RESTORE_MB} MB\n\n"
+            "_Atenção: isso vai restaurar config/usuários/SSL e reiniciar serviços._"
+        )
+        await query.edit_message_text(warn, parse_mode='Markdown')
+        return WAIT_RESTORE_FILE
+
+    await query.edit_message_text("OK.", reply_markup=build_menu())
     return SELECTING_ACTION
 
 async def unexpected_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -406,9 +388,67 @@ async def unexpected_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     return await button_handler(update, context)
 
+async def restore_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Recebe o arquivo .tar.gz enviado no Telegram e executa restore_bot.sh.
+    """
+    if not is_admin(update):
+        return SELECTING_ACTION
+
+    if not update.message:
+        return WAIT_RESTORE_FILE
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("Envie um arquivo `.tar.gz` (backup).", reply_markup=build_menu())
+        return SELECTING_ACTION
+
+    filename = (doc.file_name or "").strip()
+    if not filename.endswith(ALLOWED_EXT):
+        await update.message.reply_text("❌ Arquivo inválido. Envie um `.tar.gz`.", reply_markup=build_menu())
+        return SELECTING_ACTION
+
+    if doc.file_size and doc.file_size > (MAX_RESTORE_MB * 1024 * 1024):
+        await update.message.reply_text(f"❌ Arquivo muito grande (máx {MAX_RESTORE_MB}MB).", reply_markup=build_menu())
+        return SELECTING_ACTION
+
+    await update.message.reply_text("⬇️ Baixando backup...")
+
+    tmp_path = f"/tmp/restore_{uuid.uuid4().hex}.tar.gz"
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=tmp_path)
+
+        await update.message.reply_text("⚙️ Restaurando... (pode reiniciar o Xray e o bot)")
+
+        code, out = run_script_args(SCRIPTS["restore"], [tmp_path], timeout=300)
+
+        if code == 0 and "OK" in out:
+            await update.message.reply_text("✅ RESTORE concluído com sucesso.", reply_markup=build_menu())
+        else:
+            await update.message.reply_text(
+                f"❌ Falha no RESTORE.\n\n```\n{out[-1500:]}\n```",
+                parse_mode='Markdown',
+                reply_markup=build_menu()
+            )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro no RESTORE: {e}", reply_markup=build_menu())
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return SELECTING_ACTION
+
 async def input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, mode):
-    if not is_admin(update): return
-    if not update.message or not update.message.text: return
+    if not is_admin(update):
+        return
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text.strip().split()[0]
 
     if mode == 'create_nick':
@@ -420,21 +460,31 @@ async def input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, mode
             return GET_USERNAME_CREATE
 
         context.user_data['nick'] = text
-        await update.message.reply_text(f"Validade (dias) para `{text}`:", parse_mode='Markdown'); return GET_EXPIRY_DAYS_CREATE
+        await update.message.reply_text(f"Validade (dias) para `{text}`:", parse_mode='Markdown')
+        return GET_EXPIRY_DAYS_CREATE
 
     elif mode == 'create_days':
-        if not text.isdigit(): await update.message.reply_text("Só números."); return GET_EXPIRY_DAYS_CREATE
+        if not text.isdigit():
+            await update.message.reply_text("Só números.")
+            return GET_EXPIRY_DAYS_CREATE
         res, msg = core_create_user(context.user_data['nick'], text)
-        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=build_menu()); return SELECTING_ACTION
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=build_menu())
+        return SELECTING_ACTION
+
     elif mode == 'delete':
         msg = core_delete_user(text)
-        await update.message.reply_text(msg, reply_markup=build_menu()); return SELECTING_ACTION
+        await update.message.reply_text(msg, reply_markup=build_menu())
+        return SELECTING_ACTION
+
     elif mode == 'block':
         msg = core_block_user(text)
-        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=build_menu()); return SELECTING_ACTION
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=build_menu())
+        return SELECTING_ACTION
+
     elif mode == 'unblock':
         msg = core_unblock_user(text)
-        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=build_menu()); return SELECTING_ACTION
+        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=build_menu())
+        return SELECTING_ACTION
 
 # Wrappers
 async def h_create_nick(u, c): return await input_handler(u, c, 'create_nick')
@@ -442,7 +492,11 @@ async def h_create_days(u, c): return await input_handler(u, c, 'create_days')
 async def h_delete(u, c): return await input_handler(u, c, 'delete')
 async def h_block(u, c): return await input_handler(u, c, 'block')
 async def h_unblock(u, c): return await input_handler(u, c, 'unblock')
-async def cancel_op(u, c): await u.message.reply_text("Cancelado.", reply_markup=build_menu()); return SELECTING_ACTION
+
+async def cancel_op(u, c):
+    if u.message:
+        await u.message.reply_text("Cancelado.", reply_markup=build_menu())
+    return SELECTING_ACTION
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -451,6 +505,7 @@ def main():
         entry_points=[CommandHandler('start', start), CommandHandler('menu', start)],
         states={
             SELECTING_ACTION: [CallbackQueryHandler(button_handler)],
+
             GET_USERNAME_CREATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, h_create_nick),
                 CallbackQueryHandler(unexpected_button)
@@ -471,12 +526,20 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, h_unblock),
                 CallbackQueryHandler(unexpected_button)
             ],
+
+            # RESTORE: aguarda documento
+            WAIT_RESTORE_FILE: [
+                MessageHandler(filters.Document.ALL, restore_file_handler),
+                CallbackQueryHandler(unexpected_button),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("Envie um arquivo `.tar.gz`.", reply_markup=build_menu()))
+            ],
         },
         fallbacks=[CommandHandler('cancel', cancel_op)],
-        allow_reentry=True,
+        allow_reentry=True
     )
+
     app.add_handler(conv)
-    logger.info("DragonCore Bot V7.7 iniciado. Admin ID: %d", ADMIN_ID)
+    print("Bot Iniciado...")
     app.run_polling()
 
 if __name__ == '__main__':
