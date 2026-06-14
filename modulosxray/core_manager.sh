@@ -90,7 +90,7 @@ require_root() {
 # CORREÇÃO: 640 root:nogroup — Xray lê como nobody/nogroup, não precisa escrever.
 # 777 anterior permitia que qualquer processo do sistema sobrescrevesse o config.
 _apply_config_perms() {
-    chmod 640 "$CONFIG_PATH"
+    chmod 755 "$CONFIG_PATH"
     chown root:"$XRAY_GROUP" "$CONFIG_PATH"
 }
 
@@ -192,12 +192,12 @@ port_in_use() {
 # Evita conflito com SOCKS5 (1080) e com a porta pública do Xray.
 # Itera a partir do valor base até encontrar uma porta disponível.
 _find_free_api_port() {
-    local port="${1:-1080}"
+    local port="${1:-1085}"
     local max_port=1200
     while port_in_use "$port"; do
         port=$((port + 1))
         if [ "$port" -gt "$max_port" ]; then
-            echo -e "${TXT_RED}❌ Nenhuma porta livre encontrada para a API (${1:-1080}-${max_port}).${RESET}" >&2
+            echo -e "${TXT_RED}❌ Nenhuma porta livre encontrada para a API (${1:-1085}-${max_port}).${RESET}" >&2
             return 1
         fi
     done
@@ -265,7 +265,7 @@ func_xray_cert() {
     mv -f "$tmp" "$cert_script"
     # CORREÇÃO: 700 root:root — apenas root executa/modifica o script de certificado.
     # 777 anterior permitia que qualquer processo sobrescrevesse o certxray.sh.
-    chmod 700 "$cert_script"
+    chmod 755 "$cert_script"
     chown root:root "$cert_script"
     bash "$cert_script" "$dom"
 }
@@ -436,7 +436,7 @@ LINK=${link}
 EOF
     # CORREÇÃO: 600 root:root — contém UUID e link de conexão completo.
     # 777 anterior expunha credenciais VPN a qualquer processo do sistema.
-    chmod 600 "$CONN_INFO_FILE"
+    chmod 755 "$CONN_INFO_FILE"
     chown root:root "$CONN_INFO_FILE"
 
     echo -e "${TXT_GREEN}Link salvo em: ${CONN_INFO_FILE}${RESET}"
