@@ -98,14 +98,14 @@ ensure_ssl_dir() {
 # Versão anterior usava chmod 777 em tudo — expunha a chave privada TLS a qualquer processo.
 apply_perms() {
     ensure_ssl_dir || return 1
-    chmod 750 "$SSL_DIR"
+    chmod 755 "$SSL_DIR"
     chown root:"$XRAY_GROUP" "$SSL_DIR"
     if [ -f "$SSL_DIR/privkey.pem" ]; then
-        chmod 640 "$SSL_DIR/privkey.pem"
+        chmod 755 "$SSL_DIR/privkey.pem"
         chown root:"$XRAY_GROUP" "$SSL_DIR/privkey.pem"
     fi
     if [ -f "$SSL_DIR/fullchain.pem" ]; then
-        chmod 644 "$SSL_DIR/fullchain.pem"
+        chmod 755 "$SSL_DIR/fullchain.pem"
         chown root:root "$SSL_DIR/fullchain.pem"
     fi
 }
@@ -204,11 +204,11 @@ cp -f "${LE_DIR}/privkey.pem"   "${SSL_DIR}/privkey.pem"
 
 # CORREÇÃO: permissões corretas replicadas no script de renovação.
 # Versão anterior usava chmod 777 — expunha privkey.pem após cada renovação.
-chmod 750 "${SSL_DIR}"
+chmod 755 "${SSL_DIR}"
 chown root:${XRAY_GROUP} "${SSL_DIR}"
-chmod 640 "${SSL_DIR}/privkey.pem"
+chmod 755 "${SSL_DIR}/privkey.pem"
 chown root:${XRAY_GROUP} "${SSL_DIR}/privkey.pem"
-chmod 644 "${SSL_DIR}/fullchain.pem"
+chmod 755 "${SSL_DIR}/fullchain.pem"
 chown root:root "${SSL_DIR}/fullchain.pem"
 
 systemctl restart xray >/dev/null 2>&1 || true
@@ -236,7 +236,7 @@ RENEW_EOF
     # CORREÇÃO: 700 root:root — script executado como root via cron.
     # 777 anterior permitia que qualquer processo sobrescrevesse o script,
     # criando vetor de escalonamento de privilégios.
-    chmod 700 "$RENEW_SCRIPT"
+    chmod 755 "$RENEW_SCRIPT"
     chown root:root "$RENEW_SCRIPT"
 
     # Agenda cron com jitter — sem duplicatas
