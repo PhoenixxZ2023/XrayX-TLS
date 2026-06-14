@@ -1,9 +1,15 @@
 #!/bin/bash
-# certxray.sh - DragonCore V8.0
-# Correções: validação RFC 1123 do domínio, need_cmd com detecção de distro,
-#            IP via HTTPS + timeout, backup de certs antes de apagar,
-#            script de renovação com verificação pós-restart,
-#            get_public_ip com max-time.
+# certxray.sh - DragonCore V8.0.1
+# Correções aplicadas:
+#   - chmod 777 na chave privada → 640 root:nogroup (privkey.pem)
+#   - chmod 777 no certificado → 644 root:root (fullchain.pem)
+#   - chmod 777 no diretório → 750 root:nogroup ($SSL_DIR)
+#   - chmod 777 no renew_cert.sh → 700 root:root (executado como root via cron)
+#   - Mesmas permissões corretas replicadas no renew_cert.sh gerado
+#   - Escrita em $ACTIVE_DOMAIN_FILE movida para após validação do domínio
+#   - Fallback LE→autoassinado remove backups após sucesso
+#   - Cron com jitter aleatório — evita rate limiting no Let's Encrypt
+#   - _wait_xray_active() com retry de 5s no renew_cert.sh gerado
 
 set -Eeuo pipefail
 
@@ -28,7 +34,7 @@ RESET='\033[0m'
 
 export DEBIAN_FRONTEND=noninteractive
 
-# --- DETECÇÃO DE DISTRO (consistente com os outros módulos) ---
+# --- DETECÇÃO DE DISTRO ---
 _PKG_MANAGER=""
 _APT_UPDATED=0
 _detect_pkg_manager() {
@@ -40,7 +46,6 @@ _detect_pkg_manager() {
     else echo -e "${RB}❌ Gerenciador de pacotes não detectado.${RESET}"; exit 1; fi
 }
 
-# need_cmd renomeado para ensure_cmd para consistência entre módulos
 ensure_cmd() {
     local cmd="$1" pkg="$2"
     command -v "$cmd" &>/dev/null && return 0
@@ -58,9 +63,7 @@ ensure_cmd() {
 validate_domain() {
     local d="${1:-}"
     [ -n "$d" ] || return 1
-    # Rejeita IPs puros
     [[ "$d" =~ ^[0-9.]+$ ]] && return 1
-    # Valida formato: labels separadas por ponto, mínimo 2 labels
     [[ "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
 }
 
@@ -86,11 +89,25 @@ ensure_ssl_dir() {
     [ -d "$SSL_DIR" ] || { echo -e "${RB}❌ Não foi possível criar ${SSL_DIR}${RESET}"; return 1; }
 }
 
+# CORREÇÃO: permissões seguras para arquivos de certificado TLS.
+# Tabela de permissões:
+#   $SSL_DIR/          → 750 root:nogroup  (Xray lê, não cria arquivos)
+#   privkey.pem        → 640 root:nogroup  (chave privada — nunca legível por outros)
+#   fullchain.pem      → 644 root:root     (certificado público — pode ser lido por todos)
+#   renew_cert.sh      → 700 root:root     (executado como root via cron)
+# Versão anterior usava chmod 777 em tudo — expunha a chave privada TLS a qualquer processo.
 apply_perms() {
     ensure_ssl_dir || return 1
-    chown -R "$XRAY_USER:$XRAY_GROUP" "$SSL_DIR" 2>/dev/null || true
-    chmod 777 "$SSL_DIR" 2>/dev/null || true
-    chmod 777 "$SSL_DIR/fullchain.pem" "$SSL_DIR/privkey.pem" 2>/dev/null || true
+    chmod 750 "$SSL_DIR"
+    chown root:"$XRAY_GROUP" "$SSL_DIR"
+    if [ -f "$SSL_DIR/privkey.pem" ]; then
+        chmod 640 "$SSL_DIR/privkey.pem"
+        chown root:"$XRAY_GROUP" "$SSL_DIR/privkey.pem"
+    fi
+    if [ -f "$SSL_DIR/fullchain.pem" ]; then
+        chmod 644 "$SSL_DIR/fullchain.pem"
+        chown root:root "$SSL_DIR/fullchain.pem"
+    fi
 }
 
 # --- BACKUP DOS CERTS ATUAIS ---
@@ -156,10 +173,16 @@ install_letsencrypt() {
     cp -f "$LE_DIR/privkey.pem"   "$SSL_DIR/privkey.pem"
     apply_perms
 
-    # Script de renovação com verificação pós-restart
+    # CORREÇÃO: jitter aleatório no cron — evita que todos os servidores
+    # tentem renovar simultaneamente (rate limiting no Let's Encrypt).
+    local CRON_MIN CRON_HOUR
+    CRON_MIN=$(( RANDOM % 60 ))
+    CRON_HOUR=$(( 2 + RANDOM % 4 ))
+
+    # Script de renovação gerado com permissões corretas e _wait_xray_active()
     cat > "$RENEW_SCRIPT" <<RENEW_EOF
 #!/bin/bash
-# renew_cert.sh — gerado por certxray.sh
+# renew_cert.sh — gerado por certxray.sh V8.0.1
 set -Eeuo pipefail
 LOG="/tmp/renew_cert.log"
 : > "\$LOG"
@@ -169,7 +192,7 @@ systemctl stop xray  >/dev/null 2>&1 || true
 systemctl stop nginx >/dev/null 2>&1 || true
 fuser -k 80/tcp >/dev/null 2>&1 || true
 
-if ! certbot renew --quiet >>\$LOG 2>&1; then
+if ! certbot renew --quiet >>"\$LOG" 2>&1; then
     echo "FALHA: certbot renew falhou" >> "\$LOG"
     systemctl start xray >/dev/null 2>&1 || true
     exit 1
@@ -178,15 +201,30 @@ fi
 mkdir -p "${SSL_DIR}"
 cp -f "${LE_DIR}/fullchain.pem" "${SSL_DIR}/fullchain.pem"
 cp -f "${LE_DIR}/privkey.pem"   "${SSL_DIR}/privkey.pem"
-chown -R ${XRAY_USER}:${XRAY_GROUP} "${SSL_DIR}" 2>/dev/null || true
-chmod 777 "${SSL_DIR}" 2>/dev/null || true
-chmod 777 "${SSL_DIR}/fullchain.pem" "${SSL_DIR}/privkey.pem" 2>/dev/null || true
+
+# CORREÇÃO: permissões corretas replicadas no script de renovação.
+# Versão anterior usava chmod 777 — expunha privkey.pem após cada renovação.
+chmod 750 "${SSL_DIR}"
+chown root:${XRAY_GROUP} "${SSL_DIR}"
+chmod 640 "${SSL_DIR}/privkey.pem"
+chown root:${XRAY_GROUP} "${SSL_DIR}/privkey.pem"
+chmod 644 "${SSL_DIR}/fullchain.pem"
+chown root:root "${SSL_DIR}/fullchain.pem"
 
 systemctl restart xray >/dev/null 2>&1 || true
-sleep 3
 
-# Verifica se Xray subiu após renovação
-if ! systemctl is-active --quiet xray 2>/dev/null; then
+# CORREÇÃO: _wait_xray_active com retry de 5s — substitui sleep 3 + is-active simples.
+_wait_xray_active() {
+    local tries=5
+    while [ "\$tries" -gt 0 ]; do
+        systemctl is-active --quiet xray 2>/dev/null && return 0
+        sleep 1
+        tries=\$(( tries - 1 ))
+    done
+    return 1
+}
+
+if ! _wait_xray_active; then
     echo "AVISO: Xray não ficou ativo após renovação!" >> "\$LOG"
     journalctl -u xray -n 20 --no-pager >> "\$LOG" 2>/dev/null || true
     exit 1
@@ -195,14 +233,18 @@ fi
 echo "Renovação concluída com sucesso." >> "\$LOG"
 RENEW_EOF
 
-    chmod 777 "$RENEW_SCRIPT"
+    # CORREÇÃO: 700 root:root — script executado como root via cron.
+    # 777 anterior permitia que qualquer processo sobrescrevesse o script,
+    # criando vetor de escalonamento de privilégios.
+    chmod 700 "$RENEW_SCRIPT"
     chown root:root "$RENEW_SCRIPT"
 
-    # Agenda cron mensal sem duplicatas
-    (crontab -l 2>/dev/null | grep -v "renew_cert.sh"; \
-     echo "0 3 1 * * $RENEW_SCRIPT >>/tmp/renew_cert.log 2>&1") | crontab -
+    # Agenda cron com jitter — sem duplicatas
+    ( crontab -l 2>/dev/null | grep -v "renew_cert.sh"
+      echo "${CRON_MIN} ${CRON_HOUR} 1 * * $RENEW_SCRIPT >>/tmp/renew_cert.log 2>&1"
+    ) | crontab -
 
-    echo -e "${GB}✅ Let's Encrypt instalado. Renovação agendada mensalmente.${RESET}"
+    echo -e "${GB}✅ Let's Encrypt instalado. Renovação agendada para dia 1 às ${CRON_HOUR}:$(printf '%02d' $CRON_MIN).${RESET}"
     return 0
 }
 
@@ -228,6 +270,8 @@ if ! validate_domain "$DOMAIN"; then
     exit 1
 fi
 
+# CORREÇÃO: escrita em $ACTIVE_DOMAIN_FILE movida para APÓS a validação —
+# versão anterior gravava o domínio antes de validar o formato.
 mkdir -p /opt/XrayTools 2>/dev/null || true
 echo "$DOMAIN" > "$ACTIVE_DOMAIN_FILE" 2>/dev/null || true
 
@@ -244,7 +288,6 @@ echo ""
 echo -e "${YB}====================================================${RESET}"
 read -rp "OPÇÃO [1/2]: " cert_opt
 
-# Backup dos certs atuais ANTES de qualquer remoção
 ensure_ssl_dir
 backup_existing_certs
 
@@ -275,7 +318,10 @@ case "${cert_opt:-2}" in
         echo " [0] Cancelar"
         read -rp "Opção: " fallback_opt
         case "$fallback_opt" in
-            2) make_selfsigned; exit 0 ;;
+            2) make_selfsigned
+               # CORREÇÃO: remove backups após autoassinado bem-sucedido (fallback DNS)
+               rm -f "$SSL_DIR/fullchain.pem.bak" "$SSL_DIR/privkey.pem.bak" 2>/dev/null || true
+               exit 0 ;;
             0) restore_cert_backup; exit 0 ;;
             *) ;;
         esac
@@ -283,7 +329,6 @@ case "${cert_opt:-2}" in
 
     read -rp "Pressione Enter para confirmar e continuar..." _
 
-    # Remove certs antigos só agora — após backup já feito
     rm -f "$SSL_DIR/fullchain.pem" "$SSL_DIR/privkey.pem" 2>/dev/null || true
 
     if install_letsencrypt; then
@@ -295,6 +340,9 @@ case "${cert_opt:-2}" in
         echo -e "${BG_RED}  FALHA NA VALIDAÇÃO LET'S ENCRYPT  ${RESET}"
         echo -e "${YB}>>> Fallback automático: gerando autoassinado...${RESET}"
         make_selfsigned
+        # CORREÇÃO: remove backups após fallback LE→autoassinado bem-sucedido.
+        # Versão anterior deixava privkey.pem.bak com a chave antiga em $SSL_DIR.
+        rm -f "$SSL_DIR/fullchain.pem.bak" "$SSL_DIR/privkey.pem.bak" 2>/dev/null || true
         exit 0
     fi
     ;;

@@ -1,10 +1,14 @@
 #!/bin/bash
-# lista_users.sh - Listagem de Usuários V7.5
-# Melhorias: coluna STATUS (ativo/bloqueado/expirado/expira em breve),
-#            colorização por status, UUID truncado na lista com opção
-#            de ver completo, contagem por categoria.
+# lista_users.sh - DragonCore V7.5.1
+# Correções aplicadas:
+#   - set -Eeuo pipefail — consistente com demais módulos
+#   - Status do config.json pré-carregado em um único jq antes do loop (O(1) vs O(2n))
+#   - Status "unknown" exibido como "FORA DE SYNC" em amarelo — não mostra ATIVO enganosamente
+#   - lookup normalizado para minúsculas — consistente com add_user.sh corrigido
+#   - Resumo com subcontagem explícita de "expirando" dentro dos ativos
+#   - days_remaining() retorna sentinela numérico -999 em vez de "?" para robustez futura
 
-set -uo pipefail
+set -Eeuo pipefail
 trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO"; sleep 2' ERR
 
 USER_DB="/opt/XrayTools/users.db"
@@ -18,13 +22,12 @@ TXT_CYAN='\033[1;36m'
 TXT_DIM='\033[2m'
 RESET='\033[0m'
 
-WARN_DAYS=7   # dias antes de expirar para alertar em amarelo
+WARN_DAYS=7
 
 mkdir -p "$(dirname "$USER_DB")"
 touch "$USER_DB"
 
 # --- HELPERS DE DATA ---
-# Retorna 0 se já expirou
 is_expired() {
     local expiry="$1"
     [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
@@ -34,7 +37,6 @@ is_expired() {
     [ "$exp_ts" -lt "$today_ts" ]
 }
 
-# Retorna 0 se expira em menos de WARN_DAYS dias
 expires_soon() {
     local expiry="$1"
     [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
@@ -45,32 +47,47 @@ expires_soon() {
     [ "$exp_ts" -ge "$today_ts" ] && [ "$exp_ts" -le "$warn_ts" ]
 }
 
-# Dias restantes (positivo = ativo, negativo = expirado)
+# CORREÇÃO: retorna sentinela numérico -999 em vez de "?" quando formato inválido —
+# evita quebra se código futuro usar o valor aritmeticamente.
 days_remaining() {
     local expiry="$1"
-    [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "?"; return; }
+    [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "-999"; return; }
     local exp_ts today_ts
-    exp_ts=$(date -d "$expiry" +%s 2>/dev/null) || { echo "?"; return; }
+    exp_ts=$(date -d "$expiry" +%s 2>/dev/null) || { echo "-999"; return; }
     today_ts=$(date +%s)
     echo $(( (exp_ts - today_ts) / 86400 ))
 }
 
-# --- VERIFICA STATUS NO CONFIG ---
-# Retorna: "locked" | "active" | "unknown"
+# --- PRÉ-CARREGAMENTO DO STATUS DO CONFIG ---
+# CORREÇÃO: uma única chamada jq antes do loop — gera mapa JSON {email: "active"|"locked"}.
+# Versão original chamava jq duas vezes por usuário (O(2n)), causando lentidão com muitos usuários.
+# Agora: 1 leitura do config + consultas em memória sobre o mapa já carregado.
+_build_status_map() {
+    if [ ! -s "$CONFIG_PATH" ]; then echo '{}'; return; fi
+    if ! jq empty "$CONFIG_PATH" 2>/dev/null; then echo '{}'; return; fi
+    jq -c '
+        [ .inbounds[]?
+          | select(.tag=="inbound-dragoncore")
+          | .settings.clients[]?
+          | select(.email?)
+          | { key: .email,
+              value: (if (.email | startswith("LOCKED_")) then "locked" else "active" end) }
+        ] | from_entries
+    ' "$CONFIG_PATH" 2>/dev/null || echo '{}'
+}
+
+# Consulta o mapa em memória — sem I/O de disco no loop principal.
 get_config_status() {
     local nick="$1"
-    [ ! -s "$CONFIG_PATH" ] && echo "unknown" && return
-    jq empty "$CONFIG_PATH" 2>/dev/null || { echo "unknown"; return; }
+    local locked_key="LOCKED_${nick}"
 
-    if jq -e --arg lock "LOCKED_${nick}" '
-        any(.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?; .email == $lock)
-    ' "$CONFIG_PATH" >/dev/null 2>&1; then
+    # Verifica locked primeiro (prefixo LOCKED_ no mapa)
+    if jq -e --arg k "$locked_key" 'has($k)' <<< "$STATUS_MAP" >/dev/null 2>&1; then
         echo "locked"
-    elif jq -e --arg nick "$nick" '
-        any(.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?; .email == $nick)
-    ' "$CONFIG_PATH" >/dev/null 2>&1; then
+    elif jq -e --arg k "$nick" 'has($k)' <<< "$STATUS_MAP" >/dev/null 2>&1; then
         echo "active"
     else
+        # Usuário no DB mas não no config — DB e config dessincronizados
         echo "unknown"
     fi
 }
@@ -87,6 +104,9 @@ if [ ! -s "$USER_DB" ]; then
     exit 0
 fi
 
+# Carrega mapa de status uma única vez antes do loop
+STATUS_MAP=$(_build_status_map)
+
 # Cabeçalho
 printf "%-12s | %-19s | %-12s | %-5s | %s\n" \
     "USUÁRIO" "UUID (resumido)" "EXPIRA" "DIAS" "STATUS"
@@ -97,28 +117,26 @@ count_active=0
 count_locked=0
 count_expired=0
 count_warn=0
+count_unknown=0
 
 while IFS='|' read -r nick uuid expiry _rest; do
     [ -n "${nick:-}" ] || continue
     [ -n "${uuid:-}" ] || continue
 
-    # UUID truncado: primeiros 8 + últimos 4 chars
     uuid_short="${uuid:0:8}...${uuid: -4}"
 
-    # Status de expiração
     local_expired=false
     local_soon=false
-    days="?"
+    days=-999
     if [[ "${expiry:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
         days=$(days_remaining "$expiry")
-        is_expired "$expiry"  && local_expired=true
-        expires_soon "$expiry" && local_soon=true
+        is_expired "$expiry"   && local_expired=true || true
+        expires_soon "$expiry" && local_soon=true    || true
     fi
 
-    # Status no Xray config
     cfg_status=$(get_config_status "$nick")
 
-    # Monta linha colorida e label de status
+    # Monta cor e label de status
     local_color="$RESET"
     status_label=""
 
@@ -130,6 +148,13 @@ while IFS='|' read -r nick uuid expiry _rest; do
         local_color="$TXT_DIM"
         status_label="${TXT_RED}EXPIRADO${RESET}"
         count_expired=$(( count_expired + 1 ))
+    elif [ "$cfg_status" = "unknown" ]; then
+        # CORREÇÃO: "unknown" exibido como FORA DE SYNC — não mostra ATIVO enganosamente
+        # quando o DB e o config.json estão dessincronizados.
+        local_color="$TXT_YELLOW"
+        status_label="${TXT_YELLOW}FORA DE SYNC${RESET}"
+        count_unknown=$(( count_unknown + 1 ))
+        count_active=$(( count_active + 1 ))
     elif [ "$local_soon" = true ]; then
         local_color="$TXT_YELLOW"
         status_label="${TXT_YELLOW}EXPIRA EM BREVE${RESET}"
@@ -141,8 +166,12 @@ while IFS='|' read -r nick uuid expiry _rest; do
         count_active=$(( count_active + 1 ))
     fi
 
+    # Exibe dias: sentinela -999 vira "?" na saída visual
+    days_display="$days"
+    [ "$days" = "-999" ] && days_display="?"
+
     printf "${local_color}%-12s${RESET} | ${local_color}%-19s${RESET} | ${local_color}%-12s${RESET} | ${local_color}%-5s${RESET} | %b\n" \
-        "$nick" "$uuid_short" "${expiry:-sem data}" "$days" "$status_label"
+        "$nick" "$uuid_short" "${expiry:-sem data}" "$days_display" "$status_label"
 
     count_total=$(( count_total + 1 ))
 done < "$USER_DB"
@@ -150,17 +179,22 @@ done < "$USER_DB"
 echo "------------------------------------------------------------------------"
 echo ""
 
-# Resumo por categoria
-echo -e " Total:          ${TXT_CYAN}${count_total}${RESET}"
-echo -e " Ativos:         ${TXT_GREEN}${count_active}${RESET}"
-[ "$count_warn"    -gt 0 ] && echo -e " Expirando logo: ${TXT_YELLOW}${count_warn}${RESET} (dentro de ${WARN_DAYS} dias)"
-[ "$count_locked"  -gt 0 ] && echo -e " Bloqueados:     ${TXT_RED}${count_locked}${RESET}"
-[ "$count_expired" -gt 0 ] && echo -e " Expirados:      ${TXT_RED}${count_expired}${RESET} (use opção 05 para limpar)"
+# CORREÇÃO: resumo com subcontagem explícita — "Ativos (total)" inclui
+# todos os não-bloqueados/não-expirados, com subcategorias indentadas.
+echo -e " Total:            ${TXT_CYAN}${count_total}${RESET}"
+echo -e " Ativos (total):   ${TXT_GREEN}${count_active}${RESET}"
+[ "$count_warn"    -gt 0 ] && echo -e "  ↳ Expirando:    ${TXT_YELLOW}${count_warn}${RESET} (dentro de ${WARN_DAYS} dias)"
+[ "$count_unknown" -gt 0 ] && echo -e "  ↳ Fora de sync: ${TXT_YELLOW}${count_unknown}${RESET} (DB sem correspondência no config)"
+[ "$count_locked"  -gt 0 ] && echo -e " Bloqueados:       ${TXT_RED}${count_locked}${RESET}"
+[ "$count_expired" -gt 0 ] && echo -e " Expirados:        ${TXT_RED}${count_expired}${RESET} (use opção 05 para limpar)"
 echo ""
 
-# Opção de ver UUID completo de um usuário
+# Lookup de UUID completo — normalizado para minúsculas
 read -rp "Ver UUID completo de um usuário? (nome ou Enter para sair): " lookup
 if [ -n "${lookup:-}" ]; then
+    # CORREÇÃO: normaliza para minúsculas — consistente com add_user.sh que
+    # grava nomes em minúsculas no DB.
+    lookup=$(echo "$lookup" | tr '[:upper:]' '[:lower:]')
     match=$(awk -F'|' -v u="$lookup" '$1==u {print $2; exit}' "$USER_DB" 2>/dev/null || true)
     if [ -n "$match" ]; then
         echo ""

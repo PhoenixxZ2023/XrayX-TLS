@@ -1,11 +1,27 @@
 #!/bin/bash
-# backup.sh - Backup & Restore Seguro V7.5
-# Correções: snapshot antes do restore, verificação de integridade do tar,
-#            SHA256 gerado no backup e verificado no restore, rotação de
-#            backups antigos, permissões no config após restore, verificação
-#            de restart, listagem com tamanho e data.
+# backup.sh - DragonCore V7.5.1
+# Correções aplicadas:
+#   - chmod 0600 root:root → 640 root:nogroup no config.json e preset.json pós-restore
+#   - Permissões de /opt/XrayTools/users/*.txt restauradas explicitamente (600)
+#   - tar com --no-overwrite-dir --no-same-permissions — reduz superfície de path traversal
+#   - _cleanup() centralizado via trap EXIT desde o início
+#   - rotate_backups() usa find + mapfile — sem parse de ls, seguro com nomes especiais
+#   - _wait_xray_active() com retry de 5s — substitui sleep 2 + is-active simples
+#   - SNAP_FILE registrado para cleanup em caso de abort
 
 set -Eeuo pipefail
+
+# --- CLEANUP CENTRALIZADO ---
+_TMPDIR_BKP=""
+_SNAP_FILE=""
+_cleanup() {
+    [ -n "$_TMPDIR_BKP" ] && rm -rf "$_TMPDIR_BKP" 2>/dev/null || true
+    # SNAP_FILE é intencional para recuperação manual — só remove se restore foi bem-sucedido
+    # (controlado pelo código principal). Aqui apenas garantimos limpeza em abort inesperado
+    # se a flag _SNAP_REMOVE_OK estiver setada.
+    [ "${_SNAP_REMOVE_OK:-0}" = "1" ] && [ -n "$_SNAP_FILE" ] && rm -f "$_SNAP_FILE" 2>/dev/null || true
+}
+trap '_cleanup' EXIT
 trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; read -rp "Enter...";' ERR
 
 TXT_GREEN='\033[1;32m'
@@ -16,7 +32,8 @@ RESET='\033[0m'
 TITLE_BAR='\033[1;47;34m'
 
 BACKUP_DIR="/root/backups"
-MAX_BACKUPS=5   # quantos backups manter (rotação automática)
+MAX_BACKUPS=5
+_SNAP_REMOVE_OK=0
 
 require_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -28,6 +45,27 @@ require_root() {
 require_root
 mkdir -p "$BACKUP_DIR"
 
+# --- VERIFICAÇÃO DE XRAY ATIVO COM RETRY ---
+# Padrão adotado em todos os módulos corrigidos — substitui sleep fixo + is-active simples.
+_wait_xray_active() {
+    local tries=5
+    while [ "$tries" -gt 0 ]; do
+        systemctl is-active --quiet xray 2>/dev/null && return 0
+        sleep 1
+        tries=$(( tries - 1 ))
+    done
+    return 1
+}
+
+# --- PERMISSÕES DO CONFIG ---
+# CORREÇÃO: centralizada — 640 root:nogroup em todo restore.
+# 600 root:root anterior impedia que o Xray (nobody/nogroup) lesse o config.
+_apply_config_perms() {
+    local f="$1"
+    chmod 0640 "$f"
+    chown root:nogroup "$f"
+}
+
 # --- VALIDAÇÃO DE PATHS NO TAR (whitelist rigorosa) ---
 is_safe_tar() {
     local tarfile="$1"
@@ -35,12 +73,12 @@ is_safe_tar() {
     while IFS= read -r entry; do
         entry="${entry#./}"
         [ -n "$entry" ] || continue
-        [[ "$entry" != /* ]]    || return 1   # path absoluto
-        [[ "$entry" != *".."* ]] || return 1  # traversal
+        [[ "$entry" != /* ]]     || return 1   # path absoluto
+        [[ "$entry" != *".."* ]] || return 1   # traversal
         case "$entry" in
-            opt/XrayTools|opt/XrayTools/*)       ;;
-            usr/local/etc/xray|usr/local/etc/xray/*) ;;
-            opt/DragonCoreSSL|opt/DragonCoreSSL/*) ;;
+            opt/XrayTools|opt/XrayTools/*)            ;;
+            usr/local/etc/xray|usr/local/etc/xray/*)  ;;
+            opt/DragonCoreSSL|opt/DragonCoreSSL/*)    ;;
             *) return 1 ;;
         esac
     done < <(tar -tzf "$tarfile" 2>/dev/null)
@@ -50,13 +88,11 @@ is_safe_tar() {
 # --- VERIFICAÇÃO DE INTEGRIDADE DO TAR ---
 verify_tar_integrity() {
     local tarfile="$1"
-    # Testa leitura completa do arquivo sem extrair
     if ! tar -tzf "$tarfile" >/dev/null 2>&1; then
         echo -e "${TXT_RED}❌ Arquivo tar corrompido ou ilegível.${RESET}"
         return 1
     fi
 
-    # Verifica SHA256 se arquivo .sha256 existir ao lado
     local sha_file="${tarfile}.sha256"
     if [ -f "$sha_file" ]; then
         echo -n "Verificando integridade SHA256... "
@@ -78,16 +114,20 @@ verify_tar_integrity() {
 }
 
 # --- ROTAÇÃO DE BACKUPS ANTIGOS ---
+# CORREÇÃO: usa find + mapfile em vez de ls — seguro com nomes de arquivo
+# que contenham espaços ou caracteres especiais.
 rotate_backups() {
     local dir="$1" max="$2"
-    local count
-    count=$(ls -1 "$dir"/*.tar.gz 2>/dev/null | wc -l)
+    local -a all_backups
+    # sort -z ordena por nome (cronológico dado o timestamp no nome)
+    mapfile -d '' all_backups < <(find "$dir" -maxdepth 1 -name "*.tar.gz" -print0 | sort -z)
+    local count="${#all_backups[@]}"
     if [ "$count" -gt "$max" ]; then
         local to_remove=$(( count - max ))
         echo -e "${TXT_CYAN}Removendo ${to_remove} backup(s) antigo(s)...${RESET}"
-        ls -1t "$dir"/*.tar.gz | tail -n "$to_remove" | while read -r old; do
-            rm -f "$old" "${old}.sha256"
-            echo " removido: $(basename "$old")"
+        for (( i=0; i<to_remove; i++ )); do
+            rm -f "${all_backups[$i]}" "${all_backups[$i]}.sha256"
+            echo " removido: $(basename "${all_backups[$i]}")"
         done
     fi
 }
@@ -122,27 +162,25 @@ case "${opt:-0}" in
     FILE="${BACKUP_DIR}/backup_dragoncore_${TIMESTAMP}.tar.gz"
     SHA_FILE="${FILE}.sha256"
 
-    # Copia apenas arquivos essenciais para tmpdir
-    # Exclui venv, backups anteriores, botxray.py e arquivos desnecessarios
-    TMPDIR_BKP=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR_BKP"' EXIT
+    _TMPDIR_BKP=$(mktemp -d)
 
-    mkdir -p "$TMPDIR_BKP/opt/XrayTools"
+    mkdir -p "$_TMPDIR_BKP/opt/XrayTools"
     for f in users.db limits.db usage.db session.db active_domain; do
-        [ -f "/opt/XrayTools/$f" ] && cp -f "/opt/XrayTools/$f" "$TMPDIR_BKP/opt/XrayTools/$f"
+        [ -f "/opt/XrayTools/$f" ] && cp -f "/opt/XrayTools/$f" "$_TMPDIR_BKP/opt/XrayTools/$f"
     done
-    [ -d "/opt/XrayTools/users" ] && cp -r "/opt/XrayTools/users" "$TMPDIR_BKP/opt/XrayTools/" 2>/dev/null || true
+    [ -d "/opt/XrayTools/users" ] && \
+        cp -r "/opt/XrayTools/users" "$_TMPDIR_BKP/opt/XrayTools/" 2>/dev/null || true
 
-    mkdir -p "$TMPDIR_BKP/usr/local/etc"
-    cp -a /usr/local/etc/xray "$TMPDIR_BKP/usr/local/etc/" 2>/dev/null || true
+    mkdir -p "$_TMPDIR_BKP/usr/local/etc"
+    cp -a /usr/local/etc/xray "$_TMPDIR_BKP/usr/local/etc/" 2>/dev/null || true
 
     if [ -d "/opt/DragonCoreSSL" ]; then
-        mkdir -p "$TMPDIR_BKP/opt"
-        cp -a /opt/DragonCoreSSL "$TMPDIR_BKP/opt/" 2>/dev/null || true
+        mkdir -p "$_TMPDIR_BKP/opt"
+        cp -a /opt/DragonCoreSSL "$_TMPDIR_BKP/opt/" 2>/dev/null || true
     fi
 
     echo "Criando backup..."
-    if ! tar -czf "$FILE" -C "$TMPDIR_BKP" . >/dev/null 2>&1; then
+    if ! tar -czf "$FILE" -C "$_TMPDIR_BKP" . >/dev/null 2>&1; then
         echo -e "${TXT_RED}❌ Falha ao criar arquivo tar.${RESET}"
         rm -f "$FILE"
         exit 1
@@ -156,7 +194,6 @@ case "${opt:-0}" in
 
     chmod 600 "$FILE"
 
-    # Gera SHA256 ao lado do backup para verificação futura
     echo -n "Gerando SHA256... "
     sha256sum "$FILE" > "$SHA_FILE"
     chmod 600 "$SHA_FILE"
@@ -174,7 +211,6 @@ case "${opt:-0}" in
     fi
     echo "-----------------------------------------"
 
-    # Rotação automática
     rotate_backups "$BACKUP_DIR" "$MAX_BACKUPS"
     ;;
 
@@ -214,14 +250,12 @@ case "${opt:-0}" in
 
     FILE="${FILES[$((n-1))]}"
 
-    # Verifica integridade antes de qualquer operação
     echo ""
     echo "Verificando arquivo selecionado..."
     if ! verify_tar_integrity "$FILE"; then
         exit 1
     fi
 
-    # Valida paths dentro do tar (whitelist)
     echo -n "Validando conteúdo do backup... "
     if ! is_safe_tar "$FILE"; then
         echo -e "${TXT_RED}RECUSADO${RESET}"
@@ -236,62 +270,89 @@ case "${opt:-0}" in
     read -rp "Confirmar RESTORE? [s/N]: " ok
     [[ "${ok:-n}" =~ ^[Ss]$ ]] || { echo "Cancelado."; exit 0; }
 
-    # SNAPSHOT DO ESTADO ATUAL antes de restaurar
+    # Snapshot do estado atual — intencional para recuperação manual se restore falhar
     echo ""
     echo "Criando snapshot do estado atual (segurança)..."
     SNAP_PATHS=( "opt/XrayTools" "usr/local/etc/xray" )
     [ -d "/opt/DragonCoreSSL" ] && SNAP_PATHS+=( "opt/DragonCoreSSL" )
-    SNAP_FILE=$(mktemp /tmp/xray_restore_snap_XXXXXX.tar.gz)
-    if tar -czf "$SNAP_FILE" -C / "${SNAP_PATHS[@]}" >/dev/null 2>&1 && [ -s "$SNAP_FILE" ]; then
-        chmod 600 "$SNAP_FILE"
-        echo -e "${TXT_GREEN}Snapshot salvo em: ${SNAP_FILE}${RESET}"
+    _SNAP_FILE=$(mktemp /tmp/xray_restore_snap_XXXXXX.tar.gz)
+    if tar -czf "$_SNAP_FILE" -C / "${SNAP_PATHS[@]}" >/dev/null 2>&1 && [ -s "$_SNAP_FILE" ]; then
+        chmod 600 "$_SNAP_FILE"
+        echo -e "${TXT_GREEN}Snapshot salvo em: ${_SNAP_FILE}${RESET}"
     else
         echo -e "${TXT_YELLOW}⚠  Não foi possível criar snapshot — continuando mesmo assim.${RESET}"
-        SNAP_FILE=""
+        _SNAP_FILE=""
     fi
 
-    # Para serviços antes de substituir arquivos
     echo "Parando serviços..."
     systemctl stop xray    >/dev/null 2>&1 || true
     systemctl stop botxray >/dev/null 2>&1 || true
 
-    # Extrai backup (já validado)
+    # CORREÇÃO: flags de segurança adicionais no tar.
+    # --no-overwrite-dir: não sobrescreve permissões de diretórios existentes.
+    # --no-same-permissions: usa umask em vez das permissões do arquivo original —
+    # permissões são aplicadas explicitamente abaixo com valores conhecidos.
     echo "Restaurando arquivos..."
-    if ! tar -xzf "$FILE" -C / 2>/dev/null; then
+    if ! tar -xzf "$FILE" -C / \
+            --no-overwrite-dir \
+            --no-same-permissions \
+            2>/dev/null; then
         echo -e "${TXT_RED}❌ Falha ao extrair backup.${RESET}"
-        if [ -n "${SNAP_FILE:-}" ] && [ -f "$SNAP_FILE" ]; then
+        if [ -n "${_SNAP_FILE:-}" ] && [ -f "$_SNAP_FILE" ]; then
             echo "Restaurando snapshot anterior..."
-            tar -xzf "$SNAP_FILE" -C / >/dev/null 2>&1 || true
+            tar -xzf "$_SNAP_FILE" -C / \
+                --no-overwrite-dir \
+                --no-same-permissions \
+                >/dev/null 2>&1 || true
             echo -e "${TXT_YELLOW}Estado anterior restaurado do snapshot.${RESET}"
         fi
         exit 1
     fi
 
-    # Reforça permissões após restore (tar pode restaurar permissões erradas)
+    # CORREÇÃO: permissões explícitas após restore — tar pode restaurar
+    # permissões do backup, que podem diferir do padrão atual do projeto.
     echo "Aplicando permissões..."
-    chmod 700  /opt/XrayTools                           2>/dev/null || true
-    chmod 600  /opt/XrayTools/users.db                  2>/dev/null || true
-    chmod 0600 /usr/local/etc/xray/config.json          2>/dev/null || true
-    chown root:root /usr/local/etc/xray/config.json     2>/dev/null || true
-    chmod 0600 /usr/local/etc/xray/preset.json          2>/dev/null || true
-    chown root:root /usr/local/etc/xray/preset.json     2>/dev/null || true
+    chmod 700  /opt/XrayTools                                   2>/dev/null || true
+    chmod 600  /opt/XrayTools/users.db                          2>/dev/null || true
+    chown root:root /opt/XrayTools/users.db                     2>/dev/null || true
 
-    if [ -d /opt/DragonCoreSSL ]; then
-        chown -R nobody:nogroup /opt/DragonCoreSSL      2>/dev/null || true
-        chmod 750  /opt/DragonCoreSSL                   2>/dev/null || true
-        chmod 644  /opt/DragonCoreSSL/fullchain.pem     2>/dev/null || true
-        chmod 640  /opt/DragonCoreSSL/privkey.pem       2>/dev/null || true
+    # CORREÇÃO: 640 root:nogroup — Xray (nobody/nogroup) precisa ler o config.
+    # Versão anterior usava 600 root:root — Xray não conseguia ler após restore.
+    if [ -f /usr/local/etc/xray/config.json ]; then
+        _apply_config_perms /usr/local/etc/xray/config.json
+    fi
+    if [ -f /usr/local/etc/xray/preset.json ]; then
+        _apply_config_perms /usr/local/etc/xray/preset.json
     fi
 
-    # Reinicia e verifica
+    # CORREÇÃO: arquivos individuais de usuário — UUID e links VLESS.
+    # Não estavam incluídos no bloco de permissões original.
+    if [ -d /opt/XrayTools/users ]; then
+        chmod 700 /opt/XrayTools/users
+        find /opt/XrayTools/users -maxdepth 1 -name "*.txt" \
+            -exec chmod 600 {} \; \
+            -exec chown root:root {} \; 2>/dev/null || true
+    fi
+
+    if [ -d /opt/DragonCoreSSL ]; then
+        chmod 750 /opt/DragonCoreSSL
+        chown root:nogroup /opt/DragonCoreSSL                  2>/dev/null || true
+        chmod 644 /opt/DragonCoreSSL/fullchain.pem              2>/dev/null || true
+        chown root:root /opt/DragonCoreSSL/fullchain.pem        2>/dev/null || true
+        chmod 640 /opt/DragonCoreSSL/privkey.pem                2>/dev/null || true
+        chown root:nogroup /opt/DragonCoreSSL/privkey.pem       2>/dev/null || true
+    fi
+
     echo "Reiniciando serviços..."
     systemctl restart xray    >/dev/null 2>&1 || true
     systemctl restart botxray >/dev/null 2>&1 || true
-    sleep 2
 
+    # CORREÇÃO: _wait_xray_active() com retry de 5s — substitui sleep 2 fixo.
     echo ""
     local_xray_status="${TXT_RED}FALHA${RESET}"
-    systemctl is-active --quiet xray 2>/dev/null && local_xray_status="${TXT_GREEN}ATIVO${RESET}"
+    if _wait_xray_active; then
+        local_xray_status="${TXT_GREEN}ATIVO${RESET}"
+    fi
 
     echo -e "${TXT_GREEN}✅ Sistema restaurado!${RESET}"
     echo "-----------------------------------------"
@@ -300,13 +361,13 @@ case "${opt:-0}" in
         echo ""
         echo -e "${TXT_YELLOW}Últimas linhas do journal:${RESET}"
         journalctl -u xray -n 10 --no-pager 2>/dev/null || true
-        if [ -n "${SNAP_FILE:-}" ] && [ -f "$SNAP_FILE" ]; then
+        if [ -n "${_SNAP_FILE:-}" ] && [ -f "$_SNAP_FILE" ]; then
             echo ""
-            echo -e "${TXT_YELLOW}Snapshot disponível para recuperação manual: ${SNAP_FILE}${RESET}"
+            echo -e "${TXT_YELLOW}Snapshot disponível para recuperação manual: ${_SNAP_FILE}${RESET}"
         fi
     else
-        # Remove snapshot se restore foi bem-sucedido
-        [ -n "${SNAP_FILE:-}" ] && rm -f "$SNAP_FILE"
+        # Remove snapshot apenas se restore e restart foram bem-sucedidos
+        _SNAP_REMOVE_OK=1
     fi
     echo "-----------------------------------------"
     ;;

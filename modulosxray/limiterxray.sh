@@ -1,12 +1,23 @@
 #!/bin/bash
-# limiterxray.sh - Controle de Consumo V7.4
-# Correções: lock exclusivo contra race condition cron+UI, backup+jq empty antes
-#            de cada escrita no config, mktemp em db_delete_key, UUID fake com
-#            fallback, aritmética inteira nativa (sem bc onde possível),
-#            timeout na API do Xray, permissões nos DBs, view cruzada com user_db,
-#            detecção de distro em ensure_cmd.
+# limiterxray.sh - DragonCore V7.4.1
+# Correções aplicadas:
+#   - chmod 0600 root:root → 640 root:nogroup no config.json (safe_config_write e func_check_and_block)
+#     Xray roda como nobody/nogroup — 600 impedia leitura do config após operações do limiter
+#   - apply_config_change_and_reload() chama _apply_config_perms() após rollback
+#   - db_delete_key() aplica chmod 0600 após mv — DBs não perdem permissão
+#   - XRAY_API_PORT default 10085 — alinhado com core_manager corrigido (evita conflito SOCKS5)
+#   - nick normalizado para minúsculas em func_set_limit e func_remove_limit
+#   - tmp_usage e tmp_session registrados para cleanup via trap EXIT
+#   - func_bytes_to_human() usa awk — elimina dependência de bc
 
 set -Eeuo pipefail
+
+# --- CLEANUP CENTRALIZADO ---
+_TMP_FILES=()
+_cleanup() {
+    for f in "${_TMP_FILES[@]:-}"; do rm -f "$f" 2>/dev/null || true; done
+}
+trap '_cleanup' EXIT
 trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -17,8 +28,11 @@ SESSION_DB="/opt/XrayTools/session.db"
 USER_DB="/opt/XrayTools/users.db"
 LOG_FILE="/tmp/limiterxray.log"
 LOCK_FILE="/tmp/limiterxray.lock"
-XRAY_API_PORT="1080"
-XRAY_API_TIMEOUT=5   # segundos por chamada à API
+
+# CORREÇÃO: default 10085 — alinhado com core_manager corrigido.
+# 1080 conflita com SOCKS5 e era o valor anterior.
+XRAY_API_PORT="10085"
+XRAY_API_TIMEOUT=5
 
 TITLE_BAR='\033[1;47;34m'
 TXT_GREEN='\033[1;32m'
@@ -87,6 +101,14 @@ acquire_lock() {
 }
 release_lock() { flock -u 9; rm -f "$LOCK_FILE"; }
 
+# --- PERMISSÕES DO CONFIG ---
+# CORREÇÃO: centralizada — 640 root:nogroup em toda escrita e rollbacks.
+# 600 root:root anterior impedia que o Xray (nobody/nogroup) lesse o config.
+_apply_config_perms() {
+    chmod 0640 "$CONFIG_PATH"
+    chown root:nogroup "$CONFIG_PATH"
+}
+
 # --- INICIALIZAÇÃO ---
 : > "$LOG_FILE"
 mkdir -p "/opt/XrayTools"
@@ -94,7 +116,8 @@ touch "$LIMITS_DB" "$USAGE_DB" "$SESSION_DB" "$USER_DB"
 chmod 0600 "$LIMITS_DB" "$USAGE_DB" "$SESSION_DB"
 
 ensure_cmd jq jq
-ensure_cmd bc bc   # ainda necessário para float em bytes_to_human
+# CORREÇÃO: bc removido das dependências — func_bytes_to_human() usa awk,
+# que está disponível em qualquer sistema Unix sem instalação adicional.
 
 header_limit() {
     clear
@@ -129,24 +152,27 @@ get_real_uuid_from_db() {
     awk -F'|' -v n="$nick" '$1==n {print $2; exit}' "$USER_DB" 2>/dev/null || true
 }
 
+# CORREÇÃO: func_bytes_to_human() usa awk em vez de bc — sem dependência externa.
+# awk está disponível em qualquer sistema Unix; bc pode não estar instalado.
 func_bytes_to_human() {
     local b=${1:-0}
-    if [ "$b" -ge 1073741824 ]; then
-        echo "$(echo "scale=2; $b/1073741824" | bc) GB"
-    elif [ "$b" -ge 1048576 ]; then
-        echo "$(echo "scale=2; $b/1048576" | bc) MB"
-    else
-        echo "$(echo "scale=2; $b/1024" | bc) KB"
-    fi
+    awk -v b="$b" 'BEGIN {
+        if (b >= 1073741824)      printf "%.2f GB\n", b / 1073741824
+        else if (b >= 1048576)    printf "%.2f MB\n", b / 1048576
+        else                      printf "%.2f KB\n", b / 1024
+    }'
 }
 
-# --- DB HELPERS COM mktemp (evita colisão entre processos paralelos) ---
+# --- DB HELPERS ---
+# CORREÇÃO: db_delete_key() aplica chmod 0600 após mv —
+# tmpfile herda umask (geralmente 644), o que exporia limits/usage/session DBs.
 db_delete_key() {
     local file="$1" nick="$2"
     local tmp
     tmp=$(mktemp "${file}.tmp.XXXXXX")
     awk -F'|' -v n="$nick" '$1!=n {print}' "$file" > "$tmp"
     mv -f "$tmp" "$file"
+    chmod 0600 "$file"
 }
 
 db_get_value() {
@@ -160,40 +186,41 @@ db_set_value() {
     echo "$nick|$value" >> "$file"
 }
 
-# --- ESCRITA SEGURA NO CONFIG (backup + jq empty + mv atômico + permissões) ---
+# --- ESCRITA SEGURA NO CONFIG ---
+# CORREÇÃO: chmod 0640 root:nogroup em vez de 0600 root:root.
 safe_config_write() {
     local jq_filter="$1"
     shift
     local tmp
     tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
 
-    # Aplica filtro jq passando argumentos adicionais ("$@")
     if ! jq "$@" "$jq_filter" "$CONFIG_PATH" > "$tmp" 2>>"$LOG_FILE"; then
         rm -f "$tmp"
         echo -e "${TXT_RED}❌ Erro ao processar config com jq.${RESET}" >&2
         return 1
     fi
 
-    # Valida JSON gerado
     if ! jq empty "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         echo -e "${TXT_RED}❌ Config gerado é JSON inválido. Abortando.${RESET}" >&2
         return 1
     fi
 
-    # Backup antes de aplicar
     cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
     mv -f "$tmp" "$CONFIG_PATH"
-    chmod 0600 "$CONFIG_PATH"
-    chown root:root "$CONFIG_PATH"
+    # CORREÇÃO: 640 root:nogroup — Xray (nobody/nogroup) precisa ler o config.
+    _apply_config_perms
 }
 
 apply_config_change_and_reload() {
     if ! systemctl try-reload-or-restart xray >/dev/null 2>&1 && \
        ! systemctl restart xray >/dev/null 2>&1; then
         echo -e "${TXT_RED}❌ Falha ao recarregar Xray. Revertendo config...${RESET}" >&2
-        [ -f "${CONFIG_PATH}.bak" ] && mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        if [ -f "${CONFIG_PATH}.bak" ]; then
+            mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+            # CORREÇÃO: reaplica permissões após rollback — .bak pode ter dono diferente.
+            _apply_config_perms
+        fi
         return 1
     fi
 }
@@ -217,13 +244,17 @@ func_set_limit() {
     header_limit
     echo "Definir Limite de Dados"
     echo "--------------------------------------"
-    read -rp "Nick do usuário: " nick
-    [ -n "${nick:-}" ] || return
+    read -rp "Nick do usuário: " nick_raw
+    [ -n "${nick_raw:-}" ] || return
 
-    if ! validate_nick "$nick"; then
+    if ! validate_nick "$nick_raw"; then
         echo -e "${TXT_RED}❌ Nick inválido. Use 5-9 letras/números.${RESET}"
         read -rp "Enter..."; return
     fi
+
+    # CORREÇÃO: normaliza para minúsculas — consistente com add_user.sh corrigido.
+    local nick
+    nick=$(echo "$nick_raw" | tr '[:upper:]' '[:lower:]')
 
     if [ ! -s "$CONFIG_PATH" ] || ! jq empty "$CONFIG_PATH" 2>/dev/null; then
         echo -e "${TXT_RED}❌ Config inválida ou não encontrada.${RESET}"
@@ -243,18 +274,16 @@ func_set_limit() {
         echo "Inválido."; sleep 1; return
     fi
 
-    # Aritmética inteira nativa (sem bc)
     local bytes_limit=$(( gb_limit * 1073741824 ))
     db_set_value "$LIMITS_DB" "$nick" "$bytes_limit"
 
     read -rp "Zerar consumo atual? [s/N]: " zerar
     if [[ "${zerar:-n}" =~ ^[Ss]$ ]]; then
-        db_delete_key "$USAGE_DB" "$nick"
+        db_delete_key "$USAGE_DB"   "$nick"
         db_delete_key "$SESSION_DB" "$nick"
         echo -e "${TXT_CYAN}Histórico zerado.${RESET}"
     fi
 
-    # Desbloqueia se estava bloqueado
     if [ "$is_locked" = true ]; then
         local real_uuid
         real_uuid="$(get_real_uuid_from_db "$nick")"
@@ -285,7 +314,6 @@ func_view_usage() {
     printf "%-14s | %-12s | %-12s | %s\n" "USUÁRIO" "USADO" "LIMITE" "STATUS"
     echo "-----------------------------------------------------------"
 
-    # Coleta todos os usuários: union de users.db e limits.db
     local all_nicks=()
     while IFS='|' read -r name _; do
         [ -n "$name" ] && all_nicks+=("$name")
@@ -332,12 +360,16 @@ func_view_usage() {
 
 func_remove_limit() {
     header_limit
-    read -rp "Usuário para remover limite: " nick
-    [ -n "${nick:-}" ] || return
+    read -rp "Usuário para remover limite: " nick_raw
+    [ -n "${nick_raw:-}" ] || return
 
-    if ! validate_nick "$nick"; then
+    if ! validate_nick "$nick_raw"; then
         echo -e "${TXT_RED}❌ Nick inválido.${RESET}"; sleep 1; return
     fi
+
+    # CORREÇÃO: normaliza para minúsculas.
+    local nick
+    nick=$(echo "$nick_raw" | tr '[:upper:]' '[:lower:]')
 
     db_delete_key "$LIMITS_DB"  "$nick"
     db_delete_key "$USAGE_DB"   "$nick"
@@ -373,7 +405,6 @@ func_check_and_block() {
         [ "$MODE" = "--sync-only" ] && echo "Sincronizando (sem bloqueio)..." || echo "Sincronizando e aplicando regras..."
     }
 
-    # Valida config e API inbound
     if [ ! -s "$CONFIG_PATH" ] || ! jq empty "$CONFIG_PATH" 2>/dev/null; then
         [ "$MODE" != "--cron" ] && echo -e "${TXT_RED}❌ Config inválida.${RESET}"
         return 1
@@ -386,26 +417,26 @@ func_check_and_block() {
         return 1
     fi
 
-    # Lock exclusivo — evita race condition cron vs UI
     acquire_lock
 
     local blocked_count=0
     local config_changed=false
 
-    # Copia de trabalho dos DBs de sessão/uso
+    # CORREÇÃO: tmpfiles registrados para cleanup via trap EXIT —
+    # se o script abortar (SIGTERM do cron, etc.), os DBs temporários são removidos.
     local tmp_usage tmp_session
     tmp_usage=$(mktemp "${USAGE_DB}.work.XXXXXX")
     tmp_session=$(mktemp "${SESSION_DB}.work.XXXXXX")
+    _TMP_FILES+=("$tmp_usage" "$tmp_session")
+
     cp "$USAGE_DB"   "$tmp_usage"
     cp "$SESSION_DB" "$tmp_session"
 
     while IFS='|' read -r nick limit_bytes; do
         [ -n "${nick:-}" ] || continue
 
-        # Se já bloqueado, pula
         is_user_locked "$nick" 2>/dev/null && continue
 
-        # Consulta API com timeout
         local down up
         down=$(xray_api_stat "user>>>${nick}>>>traffic>>>downlink")
         up=$(xray_api_stat   "user>>>${nick}>>>traffic>>>uplink")
@@ -418,7 +449,6 @@ func_check_and_block() {
         last_session="$(db_get_value "$tmp_session" "$nick")"; [ -n "${last_session:-}" ] || last_session=0
         historical_usage="$(db_get_value "$tmp_usage" "$nick")"; [ -n "${historical_usage:-}" ] || historical_usage=0
 
-        # Delta robusto contra reset de contadores
         local delta
         if [ "$current_session" -lt "$last_session" ]; then
             delta="$current_session"
@@ -440,15 +470,17 @@ func_check_and_block() {
                     echo -e "${TXT_RED}❌ $nick estourou. Bloqueando...${RESET}"
 
                 local fake_uuid
-                fake_uuid=$(generate_uuid) || { echo -e "${TXT_RED}❌ UUID falhou para $nick.${RESET}" >&2; continue; }
+                fake_uuid=$(generate_uuid) || {
+                    echo -e "${TXT_RED}❌ UUID falhou para $nick.${RESET}" >&2
+                    continue
+                }
 
-                # Aplica bloqueio no config (sem reload ainda — acumulamos e recarregamos uma vez)
                 local tmp_block
                 tmp_block=$(mktemp "${CONFIG_PATH}.block.XXXXXX")
                 if jq \
-                    --arg nick "$nick" \
+                    --arg nick   "$nick" \
                     --arg locked "LOCKED_$nick" \
-                    --arg fake "$fake_uuid" \
+                    --arg fake   "$fake_uuid" \
                     '(.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
                       (if type=="array" then . else [] end)
                     |
@@ -458,7 +490,8 @@ func_check_and_block() {
                     && jq empty "$tmp_block" 2>/dev/null; then
                     cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
                     mv -f "$tmp_block" "$CONFIG_PATH"
-                    chmod 0600 "$CONFIG_PATH"
+                    # CORREÇÃO: 640 root:nogroup — Xray precisa ler após bloqueio.
+                    _apply_config_perms
                     config_changed=true
                     blocked_count=$(( blocked_count + 1 ))
                 else
@@ -473,9 +506,11 @@ func_check_and_block() {
     # Promove cópias de trabalho para DBs reais
     mv -f "$tmp_usage"   "$USAGE_DB"
     mv -f "$tmp_session" "$SESSION_DB"
+    # Remove da lista de cleanup — arquivos já promovidos
+    _TMP_FILES=("${_TMP_FILES[@]/$tmp_usage}")
+    _TMP_FILES=("${_TMP_FILES[@]/$tmp_session}")
     chmod 0600 "$USAGE_DB" "$SESSION_DB"
 
-    # Reload único ao final, se houve bloqueios
     if [ "$config_changed" = true ]; then
         apply_config_change_and_reload || true
         [ "$MODE" != "--cron" ] && \

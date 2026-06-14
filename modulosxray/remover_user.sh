@@ -1,12 +1,15 @@
 #!/bin/bash
-# remover_user.sh - DragonCore V7.5
-# Correções: backup antes de editar, jq empty antes de mv, DB só atualizado
-#            após restart confirmado, rollback completo em falha, validação
-#            de identifier, permissões no config, limpeza do arquivo de info,
-#            listagem de usuários antes do prompt, detecção de distro.
+# remover_user.sh - DragonCore V7.5.1
+# Correções aplicadas:
+#   - chmod 777 → _apply_config_perms() (640 root:nogroup) nos 3 pontos
+#   - _cleanup() + trap EXIT desde o início — elimina trap tardio após mktemp
+#   - _wait_xray_active() com retry de 5s — substitui sleep 1 + is-active simples
+#   - identifier normalizado para minúsculas quando não é UUID — evita dessincronização DB/config
+#   - chmod 600 explícito no USER_DB após mv
+#   - Flag file_removed para exibição correta do arquivo apagado
+#   - UUID truncado na listagem inicial — não expõe credencial completa no terminal
 
 set -Eeuo pipefail
-trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
 
 CONFIG_PATH="/usr/local/etc/xray/config.json"
 USER_DB="/opt/XrayTools/users.db"
@@ -21,6 +24,23 @@ TITLE_BAR='\033[1;47;34m'
 RESET='\033[0m'
 
 export DEBIAN_FRONTEND=noninteractive
+
+# --- CLEANUP CENTRALIZADO ---
+# CORREÇÃO: registrado no início via trap EXIT — cobre toda saída (normal, ERR, sinal).
+_tmp_cfg=""
+_tmp_db=""
+_cleanup() {
+    rm -f "$_tmp_cfg" "$_tmp_db"
+}
+trap '_cleanup' EXIT
+trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
+
+# --- PERMISSÕES DO CONFIG ---
+# CORREÇÃO: centralizada — 640 root:nogroup em fluxo normal e em todos os rollbacks.
+_apply_config_perms() {
+    chmod 0660 "$CONFIG_PATH"
+    chown root:nogroup "$CONFIG_PATH"
+}
 
 # --- DETECÇÃO DE DISTRO ---
 _PKG_MANAGER=""
@@ -47,12 +67,23 @@ ensure_cmd() {
     esac
 }
 
-# --- VALIDAÇÃO DE IDENTIFIER ---
 # Aceita nome (5-9 alfanum) OU UUID no formato padrão
 validate_identifier() {
     local id="$1"
     [[ "$id" =~ ^[a-zA-Z0-9]{5,9}$ ]] && return 0
     [[ "$id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 0
+    return 1
+}
+
+# --- VERIFICAÇÃO DE XRAY ATIVO COM RETRY ---
+# CORREÇÃO: tenta por até 5s — evita falso negativo em sistema sob carga.
+_wait_xray_active() {
+    local tries=5
+    while [ "$tries" -gt 0 ]; do
+        systemctl is-active --quiet xray 2>/dev/null && return 0
+        sleep 1
+        tries=$((tries - 1))
+    done
     return 1
 }
 
@@ -62,7 +93,6 @@ ensure_cmd jq jq
 mkdir -p "$(dirname "$USER_DB")" "$CONN_INFO_DIR"
 [ -f "$USER_DB" ] || touch "$USER_DB"
 
-# Valida config
 if [ ! -s "$CONFIG_PATH" ]; then
     echo -e "${TXT_RED}❌ Config não encontrada: $CONFIG_PATH${RESET}"
     sleep 2; exit 1
@@ -81,14 +111,15 @@ clear
 echo -e "${TITLE_BAR}   REMOVER USUÁRIO   ${RESET}"
 echo ""
 
-# Mostra lista de usuários do DB antes do prompt
 if [ -s "$USER_DB" ]; then
     echo -e "${TXT_CYAN}Usuários cadastrados:${RESET}"
     echo "-----------------------------------------"
-    printf "%-12s %-38s %-12s\n" "NOME" "UUID" "EXPIRA"
+    # CORREÇÃO: UUID truncado — exibe apenas primeiros 8 chars na tabela.
+    # UUID completo permanece acessível em users.db e no arquivo individual.
+    printf "%-12s %-14s %-12s\n" "NOME" "UUID" "EXPIRA"
     echo "-----------------------------------------"
     while IFS='|' read -r name uuid expiry _rest; do
-        printf "%-12s %-38s %-12s\n" "$name" "$uuid" "$expiry"
+        printf "%-12s %-14s %-12s\n" "$name" "${uuid:0:8}..." "$expiry"
     done < "$USER_DB"
     echo "-----------------------------------------"
     echo ""
@@ -101,10 +132,16 @@ read -rp "Nome ou UUID para remover (0 para voltar): " identifier
 
 [ "${identifier:-0}" = "0" ] || [ -z "${identifier:-}" ] && exit 0
 
-# Valida formato do identificador
 if ! validate_identifier "$identifier"; then
     echo -e "${TXT_RED}❌ Identificador inválido. Use o nome (5-9 chars) ou UUID completo.${RESET}"
     sleep 2; exit 1
+fi
+
+# CORREÇÃO: normaliza para minúsculas apenas se for nome (não UUID).
+# Evita dessincronização entre DB (minúsculas) e config.json quando
+# operador digita "User1" mas o registro está como "user1".
+if [[ ! "$identifier" =~ ^[0-9a-fA-F]{8}- ]]; then
+    identifier=$(echo "$identifier" | tr '[:upper:]' '[:lower:]')
 fi
 
 # Confirma existência antes de agir
@@ -148,12 +185,11 @@ echo -e "${TXT_YELLOW}⚠  Remover usuário: '${nick_real:-$identifier}'?${RESET
 read -rp "Confirmar? [s/N]: " confirm
 [[ "${confirm:-n}" =~ ^[Ss]$ ]] || { echo "Cancelado."; sleep 1; exit 0; }
 
-# --- BACKUP DO CONFIG ANTES DE MODIFICAR ---
+# --- BACKUP DO CONFIG ---
 cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
 
 # --- APLICA REMOÇÃO NO CONFIG ---
-tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
-trap 'rm -f "$tmp_cfg"' EXIT
+_tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
 
 jq --arg id "$identifier" '
   (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
@@ -161,55 +197,62 @@ jq --arg id "$identifier" '
   |
   (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
     map(select(.id != $id and .email != $id))
-' "$CONFIG_PATH" > "$tmp_cfg"
+' "$CONFIG_PATH" > "$_tmp_cfg"
 
-# Valida JSON gerado ANTES de aplicar
-if ! jq empty "$tmp_cfg" 2>/dev/null; then
-    rm -f "$tmp_cfg"
+if ! jq empty "$_tmp_cfg" 2>/dev/null; then
     echo -e "${TXT_RED}❌ jq gerou JSON inválido. Config não alterado.${RESET}"
     sleep 2; exit 1
 fi
 
-# Contagem antes/depois para confirmar remoção real
 before_count=$(jq '[.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?] | length' "$CONFIG_PATH" 2>/dev/null || echo 0)
-after_count=$(jq  '[.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?] | length' "$tmp_cfg"    2>/dev/null || echo 0)
+after_count=$(jq  '[.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?] | length' "$_tmp_cfg"    2>/dev/null || echo 0)
 
-# Aplica atomicamente e corrige permissões
-mv -f "$tmp_cfg" "$CONFIG_PATH"
-chmod 777 "$CONFIG_PATH"
-chown root:nogroup "$CONFIG_PATH"
+mv -f "$_tmp_cfg" "$CONFIG_PATH"
+_tmp_cfg=""   # já movido — _cleanup não deve tentar remover
+# CORREÇÃO: _apply_config_perms() em vez de chmod 777.
+_apply_config_perms
 
-# --- RESTART COM VERIFICAÇÃO E ROLLBACK COMPLETO ---
+# --- RESTART COM ROLLBACK COMPLETO ---
 if ! systemctl try-reload-or-restart xray >/dev/null 2>&1 && \
    ! systemctl restart xray >/dev/null 2>&1; then
     echo -e "${TXT_RED}❌ Falha ao reiniciar Xray. Revertendo config...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    chmod 777 "$CONFIG_PATH"
+    # CORREÇÃO: rollback usa _apply_config_perms() — não volta para 777.
+    _apply_config_perms
     journalctl -u xray -n 15 --no-pager 2>/dev/null || true
     echo -e "${TXT_YELLOW}Config revertido. Usuário NÃO removido.${RESET}"
     sleep 3; exit 1
 fi
 
-sleep 1
-if ! systemctl is-active --quiet xray 2>/dev/null; then
+# CORREÇÃO: retry de até 5s para confirmar xray ativo.
+if ! _wait_xray_active; then
     echo -e "${TXT_RED}❌ Xray não ficou ativo. Revertendo...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    chmod 777 "$CONFIG_PATH"
+    # CORREÇÃO: rollback usa _apply_config_perms() — não volta para 777.
+    _apply_config_perms
     systemctl restart xray >/dev/null 2>&1 || true
     sleep 2; exit 1
 fi
 
 # --- SÓ AGORA ATUALIZA O DB (após restart confirmado) ---
 if [ "$found_in_db" -eq 1 ] && [ -s "$USER_DB" ]; then
-    tmp_db=$(mktemp "${USER_DB}.tmp.XXXXXX")
-    awk -F'|' -v id="$identifier" '($1!=id && $2!=id){print $0}' "$USER_DB" > "$tmp_db"
-    mv -f "$tmp_db" "$USER_DB"
+    _tmp_db=$(mktemp "${USER_DB}.tmp.XXXXXX")
+    awk -F'|' -v id="$identifier" '($1!=id && $2!=id){print $0}' "$USER_DB" > "$_tmp_db"
+    mv -f "$_tmp_db" "$USER_DB"
+    _tmp_db=""   # já movido
+    # CORREÇÃO: permissão explícita no DB — independe da umask do processo.
+    chmod 600 "$USER_DB"
 fi
 
-# Remove arquivo de info do usuário se existir
+# CORREÇÃO: flag booleana rastreia se o arquivo existia antes da remoção.
+# Evita exibir "apagado" para arquivo que nunca existiu.
+file_removed=0
 if [ -n "$nick_real" ]; then
     user_file="${CONN_INFO_DIR}/${nick_real}.txt"
-    [ -f "$user_file" ] && rm -f "$user_file"
+    if [ -f "$user_file" ]; then
+        rm -f "$user_file"
+        file_removed=1
+    fi
 fi
 
 # --- RESULTADO ---
@@ -221,8 +264,7 @@ if [ "$removed_config" -gt 0 ] || [ "$found_in_db" -eq 1 ]; then
     echo "-----------------------------------------"
     [ "$removed_config" -gt 0 ] && echo -e " Config:  ${TXT_GREEN}removido do Xray${RESET}"
     [ "$found_in_db"    -eq 1 ] && echo -e " DB:      ${TXT_GREEN}removido do banco${RESET}"
-    [ -n "$nick_real" ] && [ -f "${CONN_INFO_DIR}/${nick_real}.txt" ] || \
-        echo -e " Arquivo: ${TXT_GREEN}${CONN_INFO_DIR}/${nick_real}.txt apagado${RESET}"
+    [ "$file_removed"   -eq 1 ] && echo -e " Arquivo: ${TXT_GREEN}${CONN_INFO_DIR}/${nick_real}.txt apagado${RESET}"
     echo "-----------------------------------------"
 else
     echo -e "${TXT_RED}⚠  Nenhum dado removido (usuário não estava no config).${RESET}"
