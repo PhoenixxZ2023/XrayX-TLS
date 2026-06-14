@@ -1,14 +1,10 @@
 #!/bin/bash
-# onlinexray.sh - DragonCore V7.5.1
-# Correções aplicadas:
-#   - API_PORT fallback 10085 → 1080 (alinhado com core_manager)
-#   - bytes_human() usa awk — elimina dependência de bc
-#   - set -Eeuo pipefail — consistente com demais módulos
-#   - Delta real por ciclo (down+up separados) — coluna "DELTA CICLO" mostra valor correto
-#   - xray_ok persistido fora do loop — aviso não some entre verificações
-#   - Chamadas API reduzidas: down+up coletados uma vez por usuário por ciclo (era 4 chamadas)
+# onlinexray.sh - Monitor Online V7.5
+# Correções: timeout em cada chamada API, exibição de delta de tráfego,
+#            detecção de Xray parado, inicialização correta de last_seen,
+#            detecção de distro em ensure_cmd.
 
-set -Eeuo pipefail
+set -uo pipefail
 trap 'echo -e "\n\033[1;33mSaindo...\033[0m"; exit 0' INT TERM
 
 GREEN='\033[1;32m'
@@ -20,9 +16,9 @@ RESET='\033[0m'
 
 CONF="/usr/local/etc/xray/config.json"
 XRAY_BIN="/usr/local/bin/xray"
-WINDOW=15
-SLEEP=3
-API_TIMEOUT=3
+WINDOW=15      # segundos — considera online se teve tráfego nessa janela
+SLEEP=3        # intervalo de polling em segundos
+API_TIMEOUT=3  # timeout por chamada à API (segundos)
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -67,7 +63,7 @@ if ! jq -e '.inbounds[]? | select(.tag=="api")' "$CONF" >/dev/null 2>&1; then
     echo -e "${RED}❌ Inbound API (tag: api) não configurado no Xray.${RESET}"; exit 1
 fi
 
-# CORREÇÃO: fallback 1080 — alinhado com core_manager (porta padrão do projeto).
+# Porta da API (dinâmica, fallback 1080)
 API_PORT="$(jq -r '.inbounds[]? | select(.tag=="api") | .port // empty' "$CONF" 2>/dev/null || true)"
 [ -n "${API_PORT:-}" ] || API_PORT="1080"
 
@@ -84,6 +80,7 @@ if [ ${#USERS[@]} -eq 0 ]; then
 fi
 
 # --- CONSULTA À API COM TIMEOUT ---
+# Retorna bytes de um stat específico; timeout evita trava
 _api_stat() {
     local name="$1"
     timeout "$API_TIMEOUT" \
@@ -94,87 +91,77 @@ _api_stat() {
         || echo "0"
 }
 
-# CORREÇÃO: bytes_human() usa awk — elimina dependência de bc.
-# bc pode não estar instalado; awk está disponível em qualquer Unix.
+get_total_bytes() {
+    local nick="$1"
+    local down up
+    down=$(_api_stat "user>>>${nick}>>>traffic>>>downlink")
+    up=$(_api_stat   "user>>>${nick}>>>traffic>>>uplink")
+    [ -n "${down:-}" ] || down=0
+    [ -n "${up:-}"   ] || up=0
+    echo $(( down + up ))
+}
+
+# --- CONVERSÃO DE BYTES ---
 bytes_human() {
     local b="${1:-0}"
-    awk -v b="$b" 'BEGIN {
-        if      (b >= 1073741824) printf "%.1f GB\n", b/1073741824
-        else if (b >= 1048576)    printf "%.1f MB\n", b/1048576
-        else if (b >= 1024)       printf "%.1f KB\n", b/1024
-        else                      printf "%d B\n",    b
-    }'
+    if   [ "$b" -ge 1073741824 ]; then printf "%.1f GB" "$(echo "scale=1; $b/1073741824" | bc)"
+    elif [ "$b" -ge 1048576    ]; then printf "%.1f MB" "$(echo "scale=1; $b/1048576"    | bc)"
+    elif [ "$b" -ge 1024       ]; then printf "%.1f KB" "$(echo "scale=1; $b/1024"       | bc)"
+    else echo "${b} B"; fi
 }
 
 # --- INICIALIZAÇÃO ---
-# CORREÇÃO: last_down e last_up separados — permite calcular delta real por ciclo.
-# Versão anterior usava soma (get_total_bytes) e o "delta" exibido era o total acumulado.
-declare -A last_down last_up last_seen
+declare -A last_bytes
+declare -A last_seen
+declare -A last_delta_down
+declare -A last_delta_up
 
 now="$(date +%s)"
 
 echo -e "${CYAN}Inicializando monitor para ${#USERS[@]} usuário(s)...${RESET}"
 for u in "${USERS[@]}"; do
-    d=$(_api_stat "user>>>${u}>>>traffic>>>downlink")
-    up=$(_api_stat "user>>>${u}>>>traffic>>>uplink")
-    [ -n "${d:-}"  ] || d=0
-    [ -n "${up:-}" ] || up=0
-    last_down["$u"]="$d"
-    last_up["$u"]="$up"
+    b="$(get_total_bytes "$u")"
+    last_bytes["$u"]="$b"
+    last_delta_down["$u"]=0
+    last_delta_up["$u"]=0
     # Se já tem tráfego no momento de abertura, considera online agora
-    if [ $(( d + up )) -gt 0 ]; then
+    if [ "${b:-0}" -gt 0 ]; then
         last_seen["$u"]="$now"
     else
         last_seen["$u"]=0
     fi
 done
 
-# CORREÇÃO: xray_ok declarado fora do loop — persiste entre ciclos.
-# Versão anterior resetava para true a cada ciclo, zerando o aviso nos 4 ciclos
-# entre verificações mesmo se o Xray tivesse caído.
-xray_ok=true
-cycle=0
-
 # --- LOOP PRINCIPAL ---
+cycle=0
 while true; do
     now="$(date +%s)"
     cycle=$(( cycle + 1 ))
 
-    # Verifica saúde do Xray a cada 5 ciclos — atualiza flag persistente
+    # Verifica saúde do Xray a cada 5 ciclos
+    xray_ok=true
     if (( cycle % 5 == 1 )); then
-        systemctl is-active --quiet xray 2>/dev/null && xray_ok=true || xray_ok=false
+        systemctl is-active --quiet xray 2>/dev/null || xray_ok=false
     fi
 
-    # CORREÇÃO: coleta down e up separados uma única vez por usuário por ciclo.
-    # Versão anterior chamava _api_stat 4 vezes para usuários ativos (2 em get_total_bytes
-    # + 2 novamente para o split). Agora são sempre 2 chamadas por usuário.
-    declare -A cur_down cur_up delta_d delta_u delta_total
-
+    # Coleta deltas
     for u in "${USERS[@]}"; do
-        d=$(_api_stat "user>>>${u}>>>traffic>>>downlink")
-        up=$(_api_stat "user>>>${u}>>>traffic>>>uplink")
-        [ -n "${d:-}"  ] || d=0
-        [ -n "${up:-}" ] || up=0
+        b="$(get_total_bytes "$u")"
+        prev="${last_bytes["$u"]:-0}"
+        delta=$(( b - prev ))
 
-        cur_down["$u"]="$d"
-        cur_up["$u"]="$up"
-
-        # Delta real desde o último ciclo — robusto contra reset de contadores
-        dd=$(( d  - last_down["$u"] ))
-        du=$(( up - last_up["$u"]   ))
-        [ "$dd" -lt 0 ] && dd="$d"
-        [ "$du" -lt 0 ] && du="$up"
-
-        delta_d["$u"]="$dd"
-        delta_u["$u"]="$du"
-        delta_total["$u"]=$(( dd + du ))
-
-        if [ $(( dd + du )) -gt 0 ]; then
+        if [ "$delta" -gt 0 ]; then
             last_seen["$u"]="$now"
+            # Estimativa de split down/up: busca individual para usuários ativos
+            down=$(_api_stat "user>>>${u}>>>traffic>>>downlink")
+            up=$(_api_stat   "user>>>${u}>>>traffic>>>uplink")
+            [ -n "${down:-}" ] || down=0
+            [ -n "${up:-}"   ] || up=0
+            last_delta_down["$u"]=$(( down - (last_bytes["$u"] - ${last_delta_up["$u"]:-0}) )) 2>/dev/null || \
+                last_delta_down["$u"]=0
+            last_delta_up["$u"]="$up"
         fi
-
-        last_down["$u"]="$d"
-        last_up["$u"]="$up"
+        last_bytes["$u"]="$b"
     done
 
     # Renderiza tela
@@ -190,28 +177,30 @@ while true; do
 
     echo -e " Hora: $(date '+%H:%M:%S')  Usuários monitorados: ${#USERS[@]}"
     echo -e "${CYAN}------------------------------------------------${RESET}"
-    printf " ${CYAN}%-14s${RESET} | ${CYAN}%-12s${RESET} | ${CYAN}%s${RESET}\n" "USUÁRIO" "DELTA CICLO" "STATUS"
+    printf " ${CYAN}%-14s${RESET} | ${CYAN}%-10s${RESET} | ${CYAN}%s${RESET}\n" "USUÁRIO" "DELTA CICLO" "STATUS"
     echo -e "${CYAN}------------------------------------------------${RESET}"
 
     online_count=0
     for u in "${USERS[@]}"; do
         seen="${last_seen["$u"]:-0}"
         age=$(( now - seen ))
-        dt="${delta_total["$u"]:-0}"
+        delta_total=$(( last_bytes["$u"] - 0 ))
 
         if [ "$seen" -gt 0 ] && [ "$age" -le "$WINDOW" ]; then
-            # CORREÇÃO: exibe delta real do ciclo atual (down+up deste período),
-            # não o total acumulado desde o início do Xray.
-            delta_h="$(bytes_human "$dt")"
-            printf " ${GREEN}%-14s${RESET} | ${YELLOW}%-12s${RESET} | ${GREEN}● Online${RESET} ${DIM}(há ${age}s)${RESET}\n" \
-                "$u" "$delta_h"
+            # Online — mostra delta do ciclo atual
+            current_b="${last_bytes["$u"]:-0}"
+            delta_human="$(bytes_human "$current_b") total"
+            printf " ${GREEN}%-14s${RESET} | ${YELLOW}%-10s${RESET} | ${GREEN}● Online${RESET} ${DIM}(há ${age}s)${RESET}\n" \
+                "$u" "$delta_human"
             online_count=$(( online_count + 1 ))
         else
+            # Offline ou sem atividade recente
             if [ "$seen" -gt 0 ]; then
-                printf " ${DIM}%-14s${RESET} | ${DIM}%-12s${RESET} | ${DIM}○ Inativo (há ${age}s)${RESET}\n" \
+                ago=$(( age ))
+                printf " ${DIM}%-14s${RESET} | ${DIM}%-10s${RESET} | ${DIM}○ Inativo (há ${ago}s)${RESET}\n" \
                     "$u" "-"
             else
-                printf " ${DIM}%-14s${RESET} | ${DIM}%-12s${RESET} | ${DIM}○ Sem atividade${RESET}\n" \
+                printf " ${DIM}%-14s${RESET} | ${DIM}%-10s${RESET} | ${DIM}○ Sem atividade${RESET}\n" \
                     "$u" "-"
             fi
         fi

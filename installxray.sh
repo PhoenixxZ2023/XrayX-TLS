@@ -1,14 +1,10 @@
 #!/bin/bash
-# installxray.sh - Instalador Premium V7.5.3 (Modular Launcher)
-# Correções aplicadas:
-#   - Race condition: backup executado em sequência antes da limpeza
-#   - Validação de shebang mais robusta (suporte a BOM UTF-8)
-#   - Falha no backup agora logada (sem silenciar com || true cego)
-#   - _get_packages retorna array para evitar word splitting em nomes futuros
-#   - fun_bar: substituição de seq por printf para evitar subprocessos
+# installxray.sh - Instalador Premium V7.5.2 (Modular Launcher)
+# Correções: Compatibilidade do curl (Ubuntu 20.04) e verificação flexível de shebang (BOM fix).
 set -Eeuo pipefail
 
 # --- TRAP DE SAÍDA ---
+# Restaura cursor e remove lock file em qualquer saída
 LOCK_FILE="/tmp/xray-install.lock"
 LOG_FILE="/tmp/xray-install.log"
 trap '_cleanup' EXIT
@@ -29,7 +25,8 @@ RESET='\033[0m'
 REPO_OWNER="PhoenixxZ2023"
 REPO_NAME="XrayX-TLS"
 
-# Validação de REPO_REF — evita injeção de paths ou URLs via variável de ambiente
+# Validação de REPO_REF: aceita apenas caracteres seguros (letras, números, -, _, ., /)
+# Evita injeção de paths ou URLs maliciosas via variável de ambiente
 _validate_ref() {
     local ref="$1"
     if [[ ! "$ref" =~ ^[a-zA-Z0-9._/-]{1,128}$ ]]; then
@@ -82,19 +79,17 @@ _install_packages() {
     esac
 }
 
-# CORREÇÃO: retorna array em vez de string — evita word splitting se nomes de pacotes
-# contiverem espaços no futuro, e torna a intenção explícita.
+# Mapeia nomes de pacotes por distro
 _get_packages() {
     case "$PKG_MANAGER" in
-        apt)     echo "curl jq cron tar" ;;
+        apt)    echo "curl jq cron tar" ;;
         dnf|yum) echo "curl jq cronie tar" ;;
-        pacman)  echo "curl jq cronie tar" ;;
+        pacman) echo "curl jq cronie tar" ;;
     esac
 }
 
 # --- BARRA DE PROGRESSO ---
-# CORREÇÃO: substituídos subprocessos seq por printf com repetição nativa,
-# reduzindo fork/exec a cada tick da barra.
+# Corrigida: agora retorna o exit code real do processo monitorado
 fun_bar() {
     local pid="$1"
     local text="$2"
@@ -105,37 +100,37 @@ fun_bar() {
         if [ "$percent" -lt 95 ]; then percent=$((percent + 1)); fi
         local filled=$((percent / 5))
         local unfilled=$((20 - filled))
-        printf "\r${AZUL}[%s]${RESET} [" "$text"
-        printf '%*s' "$filled"   | tr ' ' '#'
-        printf '%*s' "$unfilled" | tr ' ' '.'
+        printf "\r${AZUL}[${text}]${RESET} ["
+        printf "%0.s#" $(seq 1 "$filled")
+        printf "%0.s." $(seq 1 "$unfilled")
         printf "] ${AMARELO}%d%%${RESET} " "$percent"
         sleep "$delay"
     done
+    # Captura exit code real do processo
     local exit_code=0
     wait "$pid" 2>/dev/null || exit_code=$?
     tput cnorm || true
     if [ "$exit_code" -eq 0 ]; then
-        printf "\r${AZUL}[%s]${RESET} [" "$text"
-        printf '%*s' 20 | tr ' ' '#'
+        printf "\r${AZUL}[${text}]${RESET} ["
+        printf "%0.s#" $(seq 1 20)
         printf "] ${VERDE}100%% - OK!${RESET}    \n"
     else
-        printf "\r${VERMELHO}[%s]${RESET} [" "$text"
-        printf '%*s' 20 | tr ' ' '!'
-        printf "] ${VERMELHO}FALHOU! (código %d)${RESET}    \n" "$exit_code"
+        printf "\r${VERMELHO}[${text}]${RESET} ["
+        printf "%0.s!" $(seq 1 20)
+        printf "] ${VERMELHO}FALHOU! (código ${exit_code})${RESET}    \n"
         echo -e "${AMARELO}⚠  Detalhes em: ${LOG_FILE}${RESET}"
         return "$exit_code"
     fi
 }
 
 # --- VERIFICAÇÃO DE INTEGRIDADE ---
+# Baixa o SHA256 do arquivo e valida antes de usar
 _verify_sha256() {
     local file="$1"
     local sha256_url="$2"
     local expected_sha256
 
-    expected_sha256=$(curl -fLsS --retry 3 --retry-delay 1 \
-        --max-time 15 --connect-timeout 5 \
-        "$sha256_url" 2>>"$LOG_FILE" | awk '{print $1}')
+    expected_sha256=$(curl -fLsS --retry 3 --retry-delay 1 "$sha256_url" 2>>"$LOG_FILE" | awk '{print $1}')
 
     if [ -z "$expected_sha256" ]; then
         echo -e "${AMARELO}⚠  Arquivo de hash não encontrado em ${sha256_url} — verificação ignorada.${RESET}"
@@ -156,25 +151,21 @@ _verify_sha256() {
 
 # --- LOCK: evita execuções paralelas ---
 if [ -e "$LOCK_FILE" ]; then
-    # Se o lock tiver mais de 10 minutos, é resquício de instalação anterior — remove
-    lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
-    if [ "$lock_age" -gt 600 ]; then
-        echo -e "${AMARELO}⚠  Lock file antigo encontrado (${lock_age}s). Removendo e continuando...${RESET}"
-        rm -f "$LOCK_FILE"
-    else
-        echo -e "${VERMELHO}❌ Outra instalação está em andamento (${LOCK_FILE} existe).${RESET}"
-        echo -e "${AMARELO}   Se não há instalação em curso, execute: rm -f ${LOCK_FILE}${RESET}"
-        exit 1
-    fi
+    echo -e "${VERMELHO}❌ Outra instalação está em andamento (${LOCK_FILE} existe).${RESET}"
+    exit 1
 fi
 touch "$LOCK_FILE"
 
 # --- INICIALIZAÇÃO ---
 clear
+# Limpa log anterior
 : > "$LOG_FILE"
 
 echo -e "${AZUL}==================================================${RESET}"
 echo -e "${AMARELO}🚀 DRAGONCORE MODULAR - LAUNCHER V7.5${RESET}"
+echo -e "${AZUL}==================================================${RESET}"
+echo -e "  Ref:  ${VERDE}${REPO_REF}${RESET}"
+echo -e "  Log:  ${VERDE}${LOG_FILE}${RESET}"
 echo -e "${AZUL}==================================================${RESET}"
 
 # --- VERIFICAÇÃO DE ROOT ---
@@ -188,10 +179,9 @@ _detect_pkg_manager
 echo -e "  Sistema: ${VERDE}${PKG_MANAGER}${RESET}"
 echo ""
 
-# --- 1) ATUALIZAÇÃO + DEPENDÊNCIAS ---
+# --- 1) ATUALIZAÇÃO + DEPENDÊNCIAS (sequencial para evitar race condition) ---
 (
-    read -ra PKGS <<< "$(_get_packages)"
-    _install_packages "${PKGS[@]}"
+    _install_packages $(_get_packages)
 ) >>"$LOG_FILE" 2>&1 &
 PID_PKG=$!
 fun_bar "$PID_PKG" "Atualizando e Instalando Dependências" || {
@@ -200,27 +190,19 @@ fun_bar "$PID_PKG" "Atualizando e Instalando Dependências" || {
 }
 
 # --- 2) BACKUP DA INSTALAÇÃO ANTERIOR ---
-# CORREÇÃO: executado em sequência (sem &) antes da limpeza, garantindo ordem.
-# Falha no backup é logada mas não interrompe — sistema continua sem backup.
-echo -ne "${AZUL}[Fazendo Backup da Versão Anterior]${RESET} ... "
-if [ -f "$MENU_PATH" ]; then
-    if cp -f "$MENU_PATH" "$MENU_BACKUP" 2>>"$LOG_FILE"; then
-        echo -e "${VERDE}OK${RESET}"
-    else
-        echo -e "${AMARELO}AVISO — backup falhou (disco cheio?). Continuando sem ele.${RESET}"
-        echo "AVISO: backup falhou em $(date)" >>"$LOG_FILE"
+(
+    if [ -f "$MENU_PATH" ]; then
+        cp -f "$MENU_PATH" "$MENU_BACKUP" 2>>"$LOG_FILE" || true
     fi
-else
-    echo -e "${AMARELO}Nenhuma versão anterior encontrada.${RESET}"
-fi
+) &
+fun_bar $! "Fazendo Backup da Versão Anterior" || true
 
 # --- 3) LIMPEZA ANTIGA ---
-# CORREÇÃO: executado após o backup, eliminando a race condition.
 (
-    rm -f /bin/menuxray.sh       /usr/local/bin/menuxray.sh
-    rm -f /bin/limiterxray.sh    /usr/local/bin/limiterxray.sh
-    rm -f /bin/botxray.sh        /usr/local/bin/botxray.sh
-    rm -f /bin/xray-menu         /usr/bin/xray-menu
+    rm -f /bin/menuxray.sh /usr/local/bin/menuxray.sh
+    rm -f /bin/limiterxray.sh /usr/local/bin/limiterxray.sh
+    rm -f /bin/botxray.sh /usr/local/bin/botxray.sh
+    rm -f /bin/xray-menu /usr/bin/xray-menu
     rm -f /usr/local/bin/add_user.sh /usr/local/bin/rem_user.sh
 ) >>"$LOG_FILE" 2>&1 &
 fun_bar $! "Limpando Instalações Antigas" || true
@@ -235,15 +217,14 @@ fun_bar $! "Limpando Instalações Antigas" || true
         -o "$MENU_PATH" \
         "$MENU_URL" >>"$LOG_FILE" 2>&1
 
+    # Valida que arquivo não está vazio
     if [ ! -s "$MENU_PATH" ]; then
         echo "Arquivo baixado está vazio" >>"$LOG_FILE"
         exit 1
     fi
 
-    # CORREÇÃO: validação de shebang robusta — ignora BOM UTF-8 (0xEF 0xBB 0xBF)
-    # que precede o '#!' em alguns editores Windows/macOS.
-    # Usa strings via head -n1 + grep em vez de comparação byte-a-byte.
-    if ! LC_ALL=C head -n 1 "$MENU_PATH" | grep -qP '^(\xEF\xBB\xBF)?#!.*(bash|env\s)'; then
+    # Garante que começa com shebang de shell de forma flexível (ignora BOM)
+    if ! head -n 1 "$MENU_PATH" | grep -qE "bash|env"; then
         echo "Arquivo baixado não parece um shell script válido" >>"$LOG_FILE"
         exit 1
     fi
@@ -254,6 +235,7 @@ fun_bar "$PID_DOWNLOAD" "Baixando Menu Maestro" || {
     echo -e "   URL: ${MENU_URL}"
     echo -e "   Ref: ${REPO_REF}"
     echo -e "   Log: ${LOG_FILE}"
+    # Restaura backup se existir
     if [ -f "$MENU_BACKUP" ]; then
         cp -f "$MENU_BACKUP" "$MENU_PATH"
         echo -e "${AMARELO}⚠  Versão anterior restaurada.${RESET}"
@@ -282,6 +264,8 @@ echo ""
 echo -e "${AZUL}==================================================${RESET}"
 echo -e "${VERDE}🎉 SISTEMA MODULAR PRONTO! (V7.5)${RESET}"
 echo -e "${AZUL}==================================================${RESET}"
+echo -e "  Acesso:  ${VERDE}xray-menu${RESET}"
+echo -e "  Log:     ${VERDE}${LOG_FILE}${RESET}"
 if [ -f "$MENU_BACKUP" ]; then
     echo -e "  Backup:  ${VERDE}${MENU_BACKUP}${RESET}"
 fi
@@ -289,6 +273,7 @@ echo -e "${AZUL}==================================================${RESET}"
 echo ""
 sleep 1
 
+# Verifica que o executável existe e é executável antes de fazer exec
 if [ ! -x "$SHORTCUT" ]; then
     echo -e "${VERMELHO}❌ Symlink ${SHORTCUT} não encontrado ou não executável.${RESET}"
     exit 1

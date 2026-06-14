@@ -1,16 +1,10 @@
 #!/bin/bash
-# botxray.sh - DragonCore V7.7.2
-# Correções aplicadas:
-#   - Wrappers setuid: chmod 4755 → 4750 + chown root:botxray — apenas botxray executa como root
-#   - restore_bot.sh: chmod 0644 → 660 root:nogroup no config.json
-#   - restore_bot.sh: whitelist de paths mais restrita — bloqueia substituição do venv
-#   - Token lido com read -r + trim automático — compatível com todos os terminais SSH
-#   - ReadWritePaths remove /usr/local/bin — bot não precisa escrever em scripts do sistema
-#   - chown -R cirúrgico — não sobrescreve permissões de .bot_env e botxray.py
-#   - _wait_service_active() com retry de 5s substitui sleep 2 + is-active simples
-#   - /usr/local/etc/xray/ com chmod 770 root:nogroup — botxray cria tmpfiles para os.replace()
-#   - config.json com 660 root:nogroup — grupo lê E escreve (necessário para escrita atômica)
-#   - PrivateTmp=true impede uso de /tmp cross-device; tmpfile agora no mesmo dir do config
+# botxray.sh - Gerenciador do Bot Telegram V7.7
+# - Menu interativo (Instalar, Ligar, Desligar, Logs)
+# - Wrappers setuid C compilados (sem sudo, resolve nosuid)
+# - Token via EnvironmentFile
+# - ReadWritePaths corrigido
+# - Permissoes corretas e patch automatico no Python
 
 set -Eeuo pipefail
 trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (codigo: $?)"; read -rp "Enter...";' ERR
@@ -52,18 +46,6 @@ ensure_pkg() {
 
 [ "${EUID:-$(id -u)}" -ne 0 ] && { echo -e "${VERMELHO}Execute como root!${RESET}"; exit 1; }
 
-# CORREÇÃO: retry de até 5s para confirmar serviço ativo —
-# substitui sleep fixo + is-active simples em todos os restarts.
-_wait_service_active() {
-    local svc="$1" tries=5
-    while [ "$tries" -gt 0 ]; do
-        systemctl is-active --quiet "$svc" 2>/dev/null && return 0
-        sleep 1
-        tries=$(( tries - 1 ))
-    done
-    return 1
-}
-
 # ==========================================
 # FUNÇÃO DE INSTALAÇÃO
 # ==========================================
@@ -71,7 +53,7 @@ func_install_bot() {
     : > "$LOG_FILE"
     clear
     echo -e "${AZUL}==================================================${RESET}"
-    echo -e "${AMARELO}      INSTALADOR BOT TELEGRAM - V7.7.1         ${RESET}"
+    echo -e "${AMARELO}      INSTALADOR BOT TELEGRAM - V7.7           ${RESET}"
     echo -e "${AZUL}==================================================${RESET}"
     echo ""
 
@@ -83,16 +65,14 @@ func_install_bot() {
     ensure_pkg gcc        gcc
     ensure_pkg tar        tar
 
+    # python3-venv: nome varia por distro
     python3 -m venv --help >/dev/null 2>&1 || ensure_pkg python3 python3-venv || true
 
     mkdir -p /opt/XrayTools
 
     echo ""
     echo -e "${AMARELO}1. Token do BotFather (formato: 123456789:ABCdef...):${RESET}"
-    echo -e "${AMARELO}   Cole o token e pressione Enter:${RESET}"
-    read -r bot_token
-    # Remove espaços e caracteres de controle que podem vir ao colar do Telegram
-    bot_token="$(echo "${bot_token:-}" | tr -d '[:space:][:cntrl:]')"
+    read -r -p "Token: " bot_token
 
     echo ""
     echo -e "${AMARELO}2. Seu ID numerico do Telegram (Admin):${RESET}"
@@ -111,8 +91,6 @@ func_install_bot() {
     fi
 
     # --- WRAPPERS SETUID EM C ---
-    # CORREÇÃO: chmod 4750 + chown root:botxray — apenas o grupo botxray executa como root.
-    # 4755 anterior permitia que qualquer usuário do sistema executasse os wrappers como root.
     echo ""
     echo "Compilando wrappers setuid..."
     for s in add_user remover_user block_user unblock_user backup_bot restore_bot; do
@@ -122,7 +100,7 @@ func_install_bot() {
 int main(int argc, char *argv[]) {
     setuid(0); setgid(0);
     putenv("TERM=xterm");
-    putenv("HOME=/opt/XrayTools");
+    putenv("HOME=/root");
     putenv("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     char *args[] = {"/bin/bash", "/usr/local/bin/${s}.sh", (char*)0};
     execv("/bin/bash", args);
@@ -130,9 +108,8 @@ int main(int argc, char *argv[]) {
 }
 EOF
         gcc -o /usr/local/bin/wrap_${s} /tmp/wrap_${s}.c
-        # CORREÇÃO: root:botxray 4750 — somente o grupo botxray pode executar o wrapper.
-        chown root:botxray /usr/local/bin/wrap_${s}
-        chmod 4750 /usr/local/bin/wrap_${s}
+        chown root:root /usr/local/bin/wrap_${s}
+        chmod 4755 /usr/local/bin/wrap_${s}
         rm -f /tmp/wrap_${s}.c
     done
     echo -e "${VERDE}Wrappers criados com sucesso.${RESET}"
@@ -150,13 +127,11 @@ EOF
     fi
     [ -s "$tmp_bot" ] || { echo -e "${VERMELHO}botxray.py vazio.${RESET}"; rm -f "$tmp_bot"; sleep 2; return 1; }
 
-    expected_sha=$(curl -fsSL --max-time 10 \
-        "${REPO_BASE}/modulosxray/botxray.py.sha256" 2>/dev/null | awk '{print $1}' || true)
+    expected_sha=$(curl -fsSL --max-time 10 "${REPO_BASE}/modulosxray/botxray.py.sha256" 2>/dev/null | awk '{print $1}' || true)
     if [ -n "${expected_sha:-}" ]; then
         actual_sha=$(sha256sum "$tmp_bot" | awk '{print $1}')
         [ "$expected_sha" = "$actual_sha" ] || {
-            echo -e "${VERMELHO}Falha de integridade.${RESET}"; rm -f "$tmp_bot"; sleep 2; return 1
-        }
+            echo -e "${VERMELHO}Falha de integridade.${RESET}"; rm -f "$tmp_bot"; sleep 2; return 1; }
         echo -e "${VERDE}SHA256 verificado.${RESET}"
     else
         echo -e "${AMARELO}Hash nao disponivel - verificacao ignorada.${RESET}"
@@ -242,8 +217,6 @@ mkdir -p "$tmpdir/opt/XrayTools"
 for f in users.db limits.db usage.db session.db active_domain; do
     [ -f "/opt/XrayTools/$f" ] && cp -f "/opt/XrayTools/$f" "$tmpdir/opt/XrayTools/$f"
 done
-[ -d /opt/XrayTools/users ] && \
-    cp -r /opt/XrayTools/users "$tmpdir/opt/XrayTools/" 2>/dev/null || true
 mkdir -p "$tmpdir/usr/local/etc"
 cp -a /usr/local/etc/xray "$tmpdir/usr/local/etc/" 2>/dev/null || true
 mkdir -p "$tmpdir/opt"
@@ -258,8 +231,6 @@ BKPEOF
     chown root:root /usr/local/bin/backup_bot.sh
 
     # --- restore_bot.sh ---
-    # CORREÇÃO: whitelist mais restrita (bloqueia substituição do venv)
-    # e permissões corretas no config.json (640 root:nogroup).
     cat > /usr/local/bin/restore_bot.sh << 'RSTEOF'
 #!/bin/bash
 set -Eeuo pipefail
@@ -273,25 +244,12 @@ if [ -f "$SHA_FILE" ]; then
     actual=$(sha256sum "$FILE" | awk '{print $1}')
     [ "$expected" = "$actual" ] || { echo "ERR: SHA256 nao confere"; exit 5; }
 fi
-# CORREÇÃO: whitelist restrita — bloqueia substituição do venv Python.
-# Antes aceitava opt/XrayTools/* (qualquer coisa), incluindo venv/,
-# que poderia ser substituído por código arbitrário executado como botxray.
 while IFS= read -r entry; do
     entry="${entry#./}"; [ -n "$entry" ] || continue
     [[ "$entry" != /* ]]     || { echo "ERR: path absoluto"; exit 9; }
     [[ "$entry" != *".."* ]] || { echo "ERR: traversal"; exit 9; }
     case "$entry" in
-        opt/XrayTools/users.db|\
-        opt/XrayTools/limits.db|\
-        opt/XrayTools/usage.db|\
-        opt/XrayTools/session.db|\
-        opt/XrayTools/active_domain|\
-        opt/XrayTools/users|\
-        opt/XrayTools/users/*|\
-        usr/local/etc/xray|\
-        usr/local/etc/xray/*|\
-        opt/DragonCoreSSL|\
-        opt/DragonCoreSSL/*) ;;
+        opt/XrayTools/*|usr/local/etc/xray/*|opt/DragonCoreSSL/*) ;;
         *) echo "ERR: path nao permitido: $entry"; exit 9 ;;
     esac
 done < <(tar -tzf "$FILE" 2>/dev/null)
@@ -301,43 +259,23 @@ SNAP_PATHS=("opt/XrayTools" "usr/local/etc/xray")
 tar -czf "$SNAP" -C / "${SNAP_PATHS[@]}" >/dev/null 2>&1 && chmod 0600 "$SNAP" || SNAP=""
 systemctl stop xray    >/dev/null 2>&1 || true
 systemctl stop botxray >/dev/null 2>&1 || true
-if ! tar -xzf "$FILE" -C / --no-overwrite-dir --no-same-permissions 2>/dev/null; then
+if ! tar -xzf "$FILE" -C / 2>/dev/null; then
     echo "ERR: falha ao extrair"
     [ -n "${SNAP:-}" ] && tar -xzf "$SNAP" -C / >/dev/null 2>&1 || true
     systemctl start xray >/dev/null 2>&1 || true
     exit 3
 fi
-# CORREÇÃO: 640 root:nogroup — Xray (nobody/nogroup) precisa ler o config.
-# Versão anterior usava 644 — qualquer usuário lia o config com UUIDs dos clientes.
-# Diretório com 770 — botxray precisa criar tmpfiles aqui para escrita atômica
-chmod 770 /usr/local/etc/xray 2>/dev/null || true
-chown root:nogroup /usr/local/etc/xray 2>/dev/null || true
-chmod 0660 /usr/local/etc/xray/config.json 2>/dev/null || true
-chown root:nogroup /usr/local/etc/xray/config.json 2>/dev/null || true
-[ -f /usr/local/etc/xray/preset.json ] && {
-    chmod 0640 /usr/local/etc/xray/preset.json 2>/dev/null || true
-    chown root:nogroup /usr/local/etc/xray/preset.json 2>/dev/null || true
-}
-[ -d /opt/XrayTools/users ] && {
-    find /opt/XrayTools/users -maxdepth 1 -name "*.txt" \
-        -exec chmod 600 {} \; -exec chown root:root {} \; 2>/dev/null || true
-}
+chown nobody:nogroup /usr/local/etc/xray/config.json 2>/dev/null || true
+chmod 0644 /usr/local/etc/xray/config.json 2>/dev/null || true
 [ -d /opt/DragonCoreSSL ] && {
+    chown -R nobody:nogroup /opt/DragonCoreSSL 2>/dev/null || true
     chmod 750 /opt/DragonCoreSSL 2>/dev/null || true
-    chown root:nogroup /opt/DragonCoreSSL 2>/dev/null || true
     chmod 644 /opt/DragonCoreSSL/fullchain.pem 2>/dev/null || true
-    chown root:root /opt/DragonCoreSSL/fullchain.pem 2>/dev/null || true
     chmod 640 /opt/DragonCoreSSL/privkey.pem 2>/dev/null || true
-    chown root:nogroup /opt/DragonCoreSSL/privkey.pem 2>/dev/null || true
 }
 systemctl restart xray    >/dev/null 2>&1 || true
 systemctl restart botxray >/dev/null 2>&1 || true
-# Retry de até 5s para confirmar xray ativo
-_wait=5
-while [ "$_wait" -gt 0 ]; do
-    systemctl is-active --quiet xray 2>/dev/null && break
-    sleep 1; _wait=$(( _wait - 1 ))
-done
+sleep 2
 systemctl is-active --quiet xray 2>/dev/null && {
     [ -n "${SNAP:-}" ] && rm -f "$SNAP"
     echo "OK"
@@ -347,49 +285,14 @@ RSTEOF
     chown root:root /usr/local/bin/restore_bot.sh
 
     # --- PERMISSOES DO DIRETORIO ---
-    # CORREÇÃO: chown cirúrgico — apenas subdiretórios que o bot precisa escrever.
-    # chown -R botxray:botxray /opt/XrayTools anterior sobrescrevia .bot_env e botxray.py
-    # (root:botxray 640), que precisavam ser reconfigurados logo depois.
-
-    # CORREÇÃO: diretório /usr/local/etc/xray com 770 root:nogroup —
-    # botxray (via SupplementaryGroups=nogroup) precisa criar tmpfiles aqui
-    # para escrita atômica do config.json (tmpfile no mesmo dir → os.replace() funciona).
-    # PrivateTmp=true no serviço impede uso de /tmp para cross-device replace.
-    if [ -d /usr/local/etc/xray ]; then
-        chmod 770 /usr/local/etc/xray
-        chown root:nogroup /usr/local/etc/xray
-    fi
-
-    # config.json com 660 — grupo pode ler E escrever
-    if [ -f /usr/local/etc/xray/config.json ]; then
-        chmod 660 /usr/local/etc/xray/config.json
-        chown root:nogroup /usr/local/etc/xray/config.json
-    fi
-
-    mkdir -p /opt/XrayTools/backups /opt/XrayTools/users
-    chown botxray:botxray /opt/XrayTools/backups
-    chmod 0750 /opt/XrayTools/backups
-    chown botxray:botxray /opt/XrayTools/users
-    chmod 0750 /opt/XrayTools/users
-
-    # Diretório raiz — botxray lê mas não escreve fora dos subdiretórios acima
-    chown root:botxray /opt/XrayTools
+    mkdir -p /opt/XrayTools/backups
+    chown -R botxray:botxray /opt/XrayTools
     chmod 0750 /opt/XrayTools
-
-    # Arquivos críticos — root:botxray 640 (bot lê, não escreve)
+    chmod 0750 /opt/XrayTools/backups
     chown root:botxray "$ENV_FILE"
     chmod 0640 "$ENV_FILE"
     chown root:botxray "$BOT_PY"
     chmod 0640 "$BOT_PY"
-
-    # venv e DBs — botxray:botxray (bot precisa executar o venv e escrever nos DBs)
-    chown -R botxray:botxray /opt/XrayTools/venv 2>/dev/null || true
-    for db in users.db limits.db usage.db session.db; do
-        [ -f "/opt/XrayTools/$db" ] && {
-            chown botxray:botxray "/opt/XrayTools/$db"
-            chmod 0600 "/opt/XrayTools/$db"
-        }
-    done
 
     # --- SYSTEMD SERVICE ---
     cat > /etc/systemd/system/botxray.service << 'SVCEOF'
@@ -401,9 +304,6 @@ After=network.target
 Type=simple
 User=botxray
 Group=botxray
-# SupplementaryGroups=nogroup permite que botxray leia/escreva arquivos
-# com permissão root:nogroup 640 (config.json, preset.json, privkey.pem)
-SupplementaryGroups=nogroup
 WorkingDirectory=/opt/XrayTools
 EnvironmentFile=/opt/XrayTools/.bot_env
 ExecStart=/opt/XrayTools/venv/bin/python /opt/XrayTools/botxray.py
@@ -413,21 +313,19 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/opt/XrayTools /tmp /root/backups /usr/local/etc/xray
+ReadWritePaths=/opt/XrayTools /tmp /root/backups /usr/local/etc/xray /usr/local/bin
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-    # CORREÇÃO: /usr/local/bin removido do ReadWritePaths —
-    # bot roda como botxray e não precisa (nem deve) escrever em scripts do sistema.
 
     systemctl daemon-reload
     systemctl enable  botxray >/dev/null 2>&1 || true
     systemctl restart botxray >/dev/null 2>&1 || true
+    sleep 2
 
     echo ""
-    # CORREÇÃO: _wait_service_active() com retry de 5s — substitui sleep 2 fixo.
-    if _wait_service_active botxray; then
+    if systemctl is-active --quiet botxray 2>/dev/null; then
         echo -e "${VERDE}BOT ATIVADO COM SUCESSO!${RESET}"
     else
         echo -e "${AMARELO}Bot pode nao estar ativo. Verifique os logs.${RESET}"
@@ -443,9 +341,10 @@ SVCEOF
 func_start_bot() {
     echo -e "\nIniciando o Bot..."
     systemctl enable botxray >/dev/null 2>&1 || true
-    systemctl start  botxray >/dev/null 2>&1 || true
-    if _wait_service_active botxray; then
-        echo -e "${VERDE}✅ Bot iniciado e rodando!${RESET}"
+    systemctl start botxray >/dev/null 2>&1 || true
+    sleep 1
+    if systemctl is-active --quiet botxray; then
+        echo -e "${VERDE}✅ Bot iniciado e rodando perfeitamente!${RESET}"
     else
         echo -e "${VERMELHO}❌ Falha ao iniciar o Bot. Verifique os logs.${RESET}"
     fi
@@ -454,7 +353,7 @@ func_start_bot() {
 
 func_stop_bot() {
     echo -e "\nParando o Bot..."
-    systemctl stop    botxray >/dev/null 2>&1 || true
+    systemctl stop botxray >/dev/null 2>&1 || true
     systemctl disable botxray >/dev/null 2>&1 || true
     sleep 1
     echo -e "${AMARELO}⛔ Bot desligado e desativado da inicialização.${RESET}"
@@ -464,7 +363,7 @@ func_stop_bot() {
 func_view_logs() {
     clear
     echo -e "${AZUL}==================================================${RESET}"
-    echo -e "${AMARELO}   LOGS DO BOT (AO VIVO) - Pressione CTRL+C    ${RESET}"
+    echo -e "${AMARELO}   LOGS DO BOT (AO VIVO) - Pressione CTRL+C para sair   ${RESET}"
     echo -e "${AZUL}==================================================${RESET}"
     journalctl -u botxray -f || true
 }
@@ -475,9 +374,9 @@ func_view_logs() {
 while true; do
     clear
     echo -e "${AZUL}==================================================${RESET}"
-    echo -e "${AMARELO}      GERENCIADOR DO BOT TELEGRAM V7.7.1        ${RESET}"
+    echo -e "${AMARELO}      GERENCIADOR DO BOT TELEGRAM V7.7           ${RESET}"
     echo -e "${AZUL}==================================================${RESET}"
-
+    
     status_msg="${VERMELHO}NÃO INSTALADO${RESET}"
     if [ -f /etc/systemd/system/botxray.service ]; then
         if systemctl is-active --quiet botxray 2>/dev/null; then
@@ -495,7 +394,7 @@ while true; do
     echo -e " ${VERDE}[4]${RESET} VER LOGS EM TEMPO REAL"
     echo -e " ${VERMELHO}[0]${RESET} VOLTAR AO MENU PRINCIPAL"
     echo -e "${AZUL}==================================================${RESET}"
-
+    
     read -r -p "Escolha uma opção: " opt
     case "$opt" in
         1) func_install_bot ;;

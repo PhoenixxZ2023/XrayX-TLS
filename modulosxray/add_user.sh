@@ -1,14 +1,11 @@
 #!/bin/bash
-# add_user.sh - DragonCore V7.5.1
-# Correções aplicadas:
-#   - chmod 777 → 640 root:nogroup em todos os pontos (fluxo normal + rollbacks)
-#   - trap duplo eliminado — _cleanup() centralizado com trap EXIT
-#   - Verificação de xray ativo com retry de até 5s (evita falso negativo em sistema lento)
-#   - Duplicidade case-insensitive — nome normalizado para minúsculas
-#   - generate_link exibe aviso quando preset.json não existe
-#   - Rollback chama _apply_config_perms() em vez de chmod 777 manual
+# add_user.sh - DragonCore V7.5
+# Correções: rollback completo em falha, UUID com fallback + validação,
+#            jq empty antes de aplicar, permissões no config,
+#            link VLESS completo gerado via preset.json, distro-agnostic.
 
 set -Eeuo pipefail
+trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
 
 CONFIG_PATH="/usr/local/etc/xray/config.json"
 USER_DB="/opt/XrayTools/users.db"
@@ -16,6 +13,7 @@ PRESET_FILE="/usr/local/etc/xray/preset.json"
 CONN_INFO_DIR="/opt/XrayTools/users"
 LOG_FILE="/tmp/add_user.log"
 
+# Cores
 TXT_GREEN='\033[1;32m'
 TXT_RED='\033[1;31m'
 TXT_CYAN='\033[1;36m'
@@ -24,24 +22,6 @@ RESET='\033[0m'
 TITLE_BAR='\033[1;47;34m'
 
 export DEBIAN_FRONTEND=noninteractive
-
-# --- CLEANUP CENTRALIZADO ---
-# CORREÇÃO: trap único no EXIT — cobre saída normal, ERR e sinais.
-# Elimina a necessidade de redefinir trap no meio do script.
-_tmp_cfg=""
-_cleanup() {
-    rm -f "$_tmp_cfg"
-}
-trap '_cleanup' EXIT
-trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
-
-# --- PERMISSÕES DO CONFIG ---
-# CORREÇÃO: 640 root:nogroup — Xray lê como nobody/nogroup, não precisa escrever.
-# Centralizado para garantir consistência em fluxo normal e rollbacks.
-_apply_config_perms() {
-    chmod 660 "$CONFIG_PATH"
-    chown root:nogroup "$CONFIG_PATH"
-}
 
 # --- DETECÇÃO DE DISTRO ---
 _PKG_MANAGER=""
@@ -80,10 +60,12 @@ generate_uuid() {
     elif [ -r /proc/sys/kernel/random/uuid ]; then
         u=$(cat /proc/sys/kernel/random/uuid)
     else
+        # fallback via od + /dev/urandom
         u=$(od -x /dev/urandom | head -1 | \
             awk '{printf "%s%s-%s-4%s-%s%s-%s%s\n",$2,$3,$4,substr($5,2),substr($6,1,1),substr($6,2),$7,$8}' | \
             tr '[:upper:]' '[:lower:]')
     fi
+    # Valida formato UUID
     if [[ ! "$u" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
         echo -e "${TXT_RED}❌ Falha ao gerar UUID válido.${RESET}" >&2
         return 1
@@ -92,22 +74,12 @@ generate_uuid() {
 }
 
 # --- GERAÇÃO DO LINK VLESS A PARTIR DO PRESET ---
-# CORREÇÃO: exibe aviso explicativo quando preset.json não existe,
-# em vez de retornar string vazia silenciosamente.
 generate_link() {
     local uuid="$1" nick="$2"
+    [ ! -f "$PRESET_FILE" ] && echo "" && return
 
-    if [ ! -f "$PRESET_FILE" ]; then
-        echo -e "${TXT_YELLOW}⚠  preset.json não encontrado — configure o Xray primeiro (opção 04 no menu).${RESET}" >&2
-        echo ""
-        return
-    fi
-
-    jq empty "$PRESET_FILE" 2>/dev/null || {
-        echo -e "${TXT_YELLOW}⚠  preset.json com JSON inválido — link não gerado.${RESET}" >&2
-        echo ""
-        return
-    }
+    # Valida JSON do preset antes de ler
+    jq empty "$PRESET_FILE" 2>/dev/null || { echo ""; return; }
 
     local network port domain tls
     network=$(jq -r '.network // ""' "$PRESET_FILE" 2>/dev/null || echo "")
@@ -115,11 +87,7 @@ generate_link() {
     domain=$(jq -r  '.domain  // ""' "$PRESET_FILE" 2>/dev/null || echo "")
     tls=$(jq -r     '.tls     // "false"' "$PRESET_FILE" 2>/dev/null || echo "false")
 
-    [ -z "$network" ] || [ -z "$port" ] || [ -z "$domain" ] && {
-        echo -e "${TXT_YELLOW}⚠  preset.json incompleto — campos network/port/domain ausentes.${RESET}" >&2
-        echo ""
-        return
-    }
+    [ -z "$network" ] || [ -z "$port" ] || [ -z "$domain" ] && echo "" && return
 
     local sec="none"
     [ "$tls" = "true" ] && sec="tls"
@@ -135,25 +103,13 @@ generate_link() {
     echo "$link"
 }
 
-# --- VERIFICAÇÃO DE XRAY ATIVO COM RETRY ---
-# CORREÇÃO: tenta por até 5s antes de concluir falha.
-# sleep 1 simples anterior causava falso negativo em sistemas lentos.
-_wait_xray_active() {
-    local tries=5
-    while [ "$tries" -gt 0 ]; do
-        systemctl is-active --quiet xray 2>/dev/null && return 0
-        sleep 1
-        tries=$((tries - 1))
-    done
-    return 1
-}
-
 # --- INICIALIZAÇÃO ---
 : > "$LOG_FILE"
 ensure_cmd jq jq
 mkdir -p "$(dirname "$USER_DB")" "$CONN_INFO_DIR"
 touch "$USER_DB"
 
+# Valida config existente e legível
 if [ ! -s "$CONFIG_PATH" ]; then
     echo -e "${TXT_RED}❌ Config não encontrada: $CONFIG_PATH${RESET}"
     sleep 2; exit 1
@@ -162,6 +118,7 @@ if ! jq empty "$CONFIG_PATH" 2>/dev/null; then
     echo -e "${TXT_RED}❌ Config JSON inválido: $CONFIG_PATH${RESET}"
     sleep 2; exit 1
 fi
+# Confere inbound obrigatório
 if ! jq -e '.inbounds[]? | select(.tag=="inbound-dragoncore")' "$CONFIG_PATH" >/dev/null 2>&1; then
     echo -e "${TXT_RED}❌ inbound-dragoncore não encontrado no config.${RESET}"
     sleep 2; exit 1
@@ -179,26 +136,23 @@ read -rp "Nome do usuário (0 para voltar): " raw_nick
 
 [ "${raw_nick:-0}" = "0" ] || [ -z "${raw_nick:-}" ] && exit 0
 
+# Validação de formato
 if ! [[ "$raw_nick" =~ ^[a-zA-Z0-9]{5,9}$ ]]; then
     echo -e "${TXT_RED}❌ Nome inválido. Use de 5 a 9 letras/números.${RESET}"
     sleep 2; exit 1
 fi
 
-# CORREÇÃO: normaliza para minúsculas — evita que "User1" e "user1" coexistam.
-# Bash 4+ suporta ${var,,}; tr é fallback portável.
-nick=$(echo "$raw_nick" | tr '[:upper:]' '[:lower:]')
-
-# Duplicidade no DB (case-insensitive via normalização)
-if grep -q "^${nick}|" "$USER_DB" 2>/dev/null; then
-    echo -e "${TXT_RED}❌ Usuário '${nick}' já existe.${RESET}"
+# Duplicidade no DB (ancorado início da linha)
+if grep -q "^${raw_nick}|" "$USER_DB" 2>/dev/null; then
+    echo -e "${TXT_RED}❌ Usuário '${raw_nick}' já existe.${RESET}"
     sleep 2; exit 1
 fi
 
-# Duplicidade no config.json
-if jq -e --arg nick "$nick" \
+# Duplicidade no config.json (pelo campo email)
+if jq -e --arg nick "$raw_nick" \
     '.inbounds[]? | select(.tag=="inbound-dragoncore") | .settings.clients[]? | select(.email==$nick)' \
     "$CONFIG_PATH" >/dev/null 2>&1; then
-    echo -e "${TXT_RED}❌ Usuário '${nick}' já existe no config.json.${RESET}"
+    echo -e "${TXT_RED}❌ Usuário '${raw_nick}' já existe no config.json.${RESET}"
     sleep 2; exit 1
 fi
 
@@ -208,62 +162,73 @@ read -rp "Dias de validade [Enter = 30]: " days
 [[ "$days" =~ ^[0-9]+$ ]] || days=30
 (( days < 1 || days > 3650 )) && days=30
 
+# Gera UUID com fallback e valida
 uuid=$(generate_uuid) || { sleep 2; exit 1; }
+
 expiry="$(date -d "+${days} days" +%F)"
 
 # --- APLICA NO CONFIG (atômico + validação antes de mv) ---
-_tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
+tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
 
-jq --arg uuid "$uuid" --arg nick "$nick" '
+# Garante limpeza do tmp em qualquer saída
+trap 'rm -f "$tmp_cfg"; echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO"; sleep 2' ERR
+
+jq --arg uuid "$uuid" --arg nick "$raw_nick" '
   (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
     (if type == "array" then . else [] end)
   |
   (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) +=
     [{"id": $uuid, "email": $nick, "level": 0}]
-' "$CONFIG_PATH" > "$_tmp_cfg"
+' "$CONFIG_PATH" > "$tmp_cfg"
 
-if ! jq empty "$_tmp_cfg" 2>/dev/null; then
+# Valida JSON gerado ANTES de aplicar
+if ! jq empty "$tmp_cfg" 2>/dev/null; then
+    rm -f "$tmp_cfg"
     echo -e "${TXT_RED}❌ jq gerou JSON inválido. Config não alterado.${RESET}"
     sleep 2; exit 1
 fi
 
+# Backup do config anterior
 cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-mv -f "$_tmp_cfg" "$CONFIG_PATH"
-_tmp_cfg=""   # já movido — _cleanup não deve tentar remover
-_apply_config_perms
+
+# Aplica atomicamente e corrige permissões
+mv -f "$tmp_cfg" "$CONFIG_PATH"
+chmod 777 "$CONFIG_PATH"
+chown root:nogroup "$CONFIG_PATH"
 
 # --- RESTART COM VERIFICAÇÃO E ROLLBACK ---
 if ! systemctl try-reload-or-restart xray >/dev/null 2>&1 && \
    ! systemctl restart xray >/dev/null 2>&1; then
     echo -e "${TXT_RED}❌ Falha ao reiniciar Xray. Revertendo config...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    # CORREÇÃO: rollback usa _apply_config_perms() — não volta para 777.
-    _apply_config_perms
+    chmod 777 "$CONFIG_PATH"
     echo -e "${TXT_YELLOW}Config revertido. Usuário NÃO criado.${RESET}"
     journalctl -u xray -n 15 --no-pager 2>/dev/null || true
     sleep 3; exit 1
 fi
 
-# CORREÇÃO: retry de até 5s para confirmar xray ativo.
-if ! _wait_xray_active; then
+# Aguarda Xray estabilizar e confirma que está ativo
+sleep 1
+if ! systemctl is-active --quiet xray 2>/dev/null; then
     echo -e "${TXT_RED}❌ Xray não ficou ativo após restart. Revertendo...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    # CORREÇÃO: rollback usa _apply_config_perms() — não volta para 777.
-    _apply_config_perms
+    chmod 777 "$CONFIG_PATH"
     systemctl restart xray >/dev/null 2>&1 || true
     sleep 2; exit 1
 fi
 
 # --- GRAVA NO DB SOMENTE APÓS RESTART OK ---
-echo "${nick}|${uuid}|${expiry}" >> "$USER_DB"
+echo "${raw_nick}|${uuid}|${expiry}" >> "$USER_DB"
 
-link=$(generate_link "$uuid" "$nick")
+# Gera link completo
+link=$(generate_link "$uuid" "$raw_nick")
 
-user_file="${CONN_INFO_DIR}/${nick}.txt"
+# Salva info do usuário em arquivo seguro
+user_file="${CONN_INFO_DIR}/${raw_nick}.txt"
 {
-    echo "# DragonCore - Usuário: ${nick}"
+    echo "# DragonCore - Usuário: ${raw_nick}"
     echo "# Criado em: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "NOME=${nick}"
+    echo "NOME=${raw_nick}"
     echo "UUID=${uuid}"
     echo "EXPIRA=${expiry}"
     [ -n "$link" ] && echo "LINK=${link}"
@@ -274,8 +239,15 @@ chmod 0600 "$user_file"
 clear
 echo -e "${TXT_GREEN}✅ Usuário criado com sucesso!${RESET}"
 echo "-----------------------------------------"
-echo -e " 👤 Nome:   ${TXT_CYAN}${nick}${RESET}"
-echo -e " 🔑 UUID:   ${TXT_YELLOW}${uuid}${RESET}"
-echo -e " 📅 Expira: ${expiry} (${days} dias)"
+echo -e " Nome:   ${TXT_CYAN}${raw_nick}${RESET}"
+echo -e " UUID:   ${TXT_YELLOW}${uuid}${RESET}"
+echo -e " Expira: ${expiry} (${days} dias)"
+if [ -n "$link" ]; then
+    echo ""
+    echo -e " ${TXT_YELLOW}Link VLESS:${RESET}"
+    echo -e " ${TXT_CYAN}${link}${RESET}"
+fi
+echo "-----------------------------------------"
+echo -e " Salvo em: ${user_file}"
 echo "-----------------------------------------"
 read -rp "Enter para voltar..."

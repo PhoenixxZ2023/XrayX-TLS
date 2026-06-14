@@ -1,12 +1,7 @@
 #!/bin/bash
-# core_manager.sh - DragonCore V7.8.2
-# Correções aplicadas:
-#   - chmod 777 → 640/600/700 em todos os arquivos sensíveis
-#   - connection_info.txt (UUID + link) agora 600 root:root
-#   - certxray.sh agora 700 root:root — impede substituição por processo não-root
-#   - Porta API padrão 1080 com fallback dinâmico via _find_free_api_port()
-#   - Validação de shebang BOM-safe em func_install_official_core e func_xray_cert
-#   - validate_domain_or_ip rejeita loopback, broadcast e endereços reservados óbvios
+# core_manager.sh - DragonCore V7.8.1
+# PERMISSÃO CORRETA: 0640 root:nogroup — Xray roda como User=nobody (grupo nogroup)
+# CORREÇÃO: "set -e gotchas" resolvidos. Substituídos atalhos && por blocos if estruturados.
 
 set -Eeuo pipefail
 trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; read -rp "Enter para continuar...";' ERR
@@ -24,10 +19,6 @@ CRT_FILE="$SSL_DIR/fullchain.pem"
 
 XRAY_USER="nobody"
 XRAY_GROUP="nogroup"
-
-# Porta API configurável via variável de ambiente.
-# Padrão 1080 — porta padrão do projeto DragonCore.
-API_PORT="${XRAY_API_PORT:-1085}"
 
 _validate_repo_base() {
     local url="$1"
@@ -87,10 +78,8 @@ require_root() {
     fi
 }
 
-# CORREÇÃO: 640 root:nogroup — Xray lê como nobody/nogroup, não precisa escrever.
-# 777 anterior permitia que qualquer processo do sistema sobrescrevesse o config.
 _apply_config_perms() {
-    chmod 755 "$CONFIG_PATH"
+    chmod 777 "$CONFIG_PATH"
     chown root:"$XRAY_GROUP" "$CONFIG_PATH"
 }
 
@@ -104,48 +93,23 @@ validate_port() {
 
 validate_domain() {
     local d="${1:-}"
-    # Remove espacos, tabs e caracteres de controle invisiveis (comum em input colado)
-    d="$(echo "$d" | tr -d '[:space:][:cntrl:]')"
     if [ -z "$d" ]; then return 1; fi
-    # Rejeita IPs puros
     if [[ "$d" =~ ^[0-9.]+$ ]]; then return 1; fi
-    # RFC 1123: labels de 1-63 chars alfanum/hifen, nao comeca/termina com hifen.
-    # Aceita labels curtas (ex: "pp" em "pp.ua") e hifens no meio (ex: "turbonet-vpn").
-    if [[ "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-        return 0
-    fi
+    if [[ "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then return 0; fi
     return 1
 }
 
-# CORREÇÃO: rejeita IPs reservados/inválidos como endereço público de VPS.
-# Bloqueia: loopback (127.x), não-roteável (0.x), broadcast (255.255.255.255),
-# link-local (169.254.x) e multicast (224-239.x).
 validate_domain_or_ip() {
     local d="${1:-}"
-    # Remove caracteres de controle e espaços (input colado com formatação)
-    d="$(echo "$d" | tr -d '[:space:][:cntrl:]')"
     if [ -z "$d" ]; then return 1; fi
-
     if [[ "$d" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
         local IFS='.'
         read -ra parts <<< "$d"
         for p in "${parts[@]}"; do
             if ! (( p <= 255 )); then return 1; fi
         done
-
-        local o1="${parts[0]}" o2="${parts[1]}"
-        # Rejeita IPs não-roteáveis como endereço público
-        if [ "$o1" -eq 0 ] || [ "$o1" -eq 127 ]; then return 1; fi          # 0.x, loopback
-        if [ "$o1" -eq 255 ]; then return 1; fi                               # broadcast
-        if [ "$o1" -eq 169 ] && [ "$o2" -eq 254 ]; then return 1; fi         # link-local
-        if (( o1 >= 224 && o1 <= 239 )); then return 1; fi                    # multicast
-        if [ "$o1" -eq 10 ]; then return 1; fi                                # RFC1918 10.x
-        if [ "$o1" -eq 172 ] && (( o2 >= 16 && o2 <= 31 )); then return 1; fi # RFC1918 172.16-31.x
-        if [ "$o1" -eq 192 ] && [ "$o2" -eq 168 ]; then return 1; fi         # RFC1918 192.168.x
-
         return 0
     fi
-
     validate_domain "$d"
 }
 
@@ -188,22 +152,6 @@ port_in_use() {
     return 1
 }
 
-# CORREÇÃO: busca dinâmica de porta livre para a API.
-# Evita conflito com SOCKS5 (1080) e com a porta pública do Xray.
-# Itera a partir do valor base até encontrar uma porta disponível.
-_find_free_api_port() {
-    local port="${1:-1085}"
-    local max_port=1200
-    while port_in_use "$port"; do
-        port=$((port + 1))
-        if [ "$port" -gt "$max_port" ]; then
-            echo -e "${TXT_RED}❌ Nenhuma porta livre encontrada para a API (${1:-1085}-${max_port}).${RESET}" >&2
-            return 1
-        fi
-    done
-    echo "$port"
-}
-
 func_install_official_core() {
     header_blue "INSTALANDO XRAY CORE"
     ensure_cmd unzip unzip
@@ -229,9 +177,7 @@ func_install_official_core() {
         rm -f "$install_script"; sleep 2; return 1
     fi
 
-    # CORREÇÃO: validação de shebang BOM-safe — consistente com run_module() no menuxray.sh.
-    # grep -qE "bash|env" anterior aceitava qualquer linha com essas substrings.
-    if ! LC_ALL=C head -n 1 "$install_script" | grep -qP '^(\xEF\xBB\xBF)?#!.*(bash|env\s)'; then
+    if ! head -n 1 "$install_script" | grep -qE "bash|env"; then
         echo -e "${TXT_RED}❌ Script inválido.${RESET}"; rm -f "$install_script"; return 1
     fi
 
@@ -257,21 +203,17 @@ func_xray_cert() {
         rm -f "$tmp"; return 1
     fi
 
-    # CORREÇÃO: validação de shebang BOM-safe.
-    if ! LC_ALL=C head -n 1 "$tmp" | grep -qP '^(\xEF\xBB\xBF)?#!.*(bash|env\s)'; then
+    if ! head -n 1 "$tmp" | grep -qE "bash|env"; then
         echo -e "${TXT_RED}❌ certxray.sh inválido.${RESET}"; rm -f "$tmp"; return 1
     fi
 
     mv -f "$tmp" "$cert_script"
-    # CORREÇÃO: 700 root:root — apenas root executa/modifica o script de certificado.
-    # 777 anterior permitia que qualquer processo sobrescrevesse o certxray.sh.
-    chmod 755 "$cert_script"
-    chown root:root "$cert_script"
+    chmod 777 "$cert_script"
     bash "$cert_script" "$dom"
 }
 
 func_generate_config() {
-    local port="$1" network="$2" domain="$3" use_tls="$4"
+    local port="$1" network="$2" domain="$3" api_port="$4" use_tls="$5"
 
     ensure_cmd jq jq
     mkdir -p "$(dirname "$CONFIG_PATH")" "$XRAYTOOLS_DIR" "$SSL_DIR"
@@ -283,11 +225,13 @@ func_generate_config() {
         fi
     fi
 
-    # CORREÇÃO: porta API resolvida com busca dinâmica de porta livre.
-    # Antes: hardcoded "1080" (conflito SOCKS5) com fallback que também tentava 1080.
-    local api_port
-    if ! api_port=$(_find_free_api_port "$API_PORT"); then
-        read -rp "Pressione Enter..."; return 1
+    if port_in_use "$api_port"; then
+        echo -e "${TXT_YELLOW}⚠  Porta API ${api_port} em uso. Tentando 1080...${RESET}"
+        api_port="1080"
+        if port_in_use "$api_port"; then
+            echo -e "${TXT_RED}❌ Porta 1080 também em uso.${RESET}"
+            read -rp "Pressione Enter..."; return 1
+        fi
     fi
 
     local policy='{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true}}'
@@ -297,33 +241,27 @@ func_generate_config() {
     case "$network" in
         xhttp)
             if [ "$use_tls" = "true" ]; then
-                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
-                    '{network:"xhttp",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],alpn:["h2","http/1.1"],minVersion:"1.2"},xhttpSettings:{path:"/",scMaxBufferedPosts:30,scMaxEachPostBytes:"1000000",scStreamUpServerSecs:"20-80",xPaddingBytes:"100-1000"}}')
+                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network:"xhttp",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],alpn:["h2","http/1.1"],minVersion:"1.2"},xhttpSettings:{path:"/",scMaxBufferedPosts:30,scMaxEachPostBytes:"1000000",scStreamUpServerSecs:"20-80",xPaddingBytes:"100-1000"}}')
             else
-                stream_settings=$(jq -n \
-                    '{network:"xhttp",security:"none",xhttpSettings:{path:"/",scMaxBufferedPosts:30,scMaxEachPostBytes:"1000000",scStreamUpServerSecs:"20-80",xPaddingBytes:"100-1000"}}')
+                stream_settings=$(jq -n '{network:"xhttp",security:"none",xhttpSettings:{path:"/",scMaxBufferedPosts:30,scMaxEachPostBytes:"1000000",scStreamUpServerSecs:"20-80",xPaddingBytes:"100-1000"}}')
             fi ;;
         ws)
             if [ "$use_tls" = "true" ]; then
-                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
-                    '{network:"ws",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"},wsSettings:{acceptProxyProtocol:false,path:"/"}}')
+                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network:"ws",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"},wsSettings:{acceptProxyProtocol:false,path:"/"}}')
             else
                 stream_settings=$(jq -n '{network:"ws",security:"none",wsSettings:{acceptProxyProtocol:false,path:"/"}}')
             fi ;;
         grpc)
             if [ "$use_tls" = "true" ]; then
-                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
-                    '{network:"grpc",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"},grpcSettings:{serviceName:"gRPC"}}')
+                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network:"grpc",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"},grpcSettings:{serviceName:"gRPC"}}')
             else
                 stream_settings=$(jq -n '{network:"grpc",security:"none",grpcSettings:{serviceName:"gRPC"}}')
             fi ;;
         vision)
-            stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
-                '{network:"tcp",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"},tcpSettings:{header:{type:"none"}}}') ;;
+            stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network:"tcp",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"},tcpSettings:{header:{type:"none"}}}') ;;
         *)
             if [ "$use_tls" = "true" ]; then
-                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" \
-                    '{network:"tcp",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"}}')
+                stream_settings=$(jq -n --arg dom "$domain" --arg crt "$CRT_FILE" --arg key "$KEY_FILE" '{network:"tcp",security:"tls",tlsSettings:{serverName:$dom,certificates:[{certificateFile:$crt,keyFile:$key}],minVersion:"1.2"}}')
             else
                 stream_settings=$(jq -n '{network:"tcp",security:"none"}')
             fi ;;
@@ -362,12 +300,12 @@ func_generate_config() {
     fi
 
     mv -f "$tmp_config" "$CONFIG_PATH"
+
     _apply_config_perms
 
     jq -n --arg network "$network" --arg port "$port" --arg domain "$domain" --arg tls "$use_tls" \
         '{network:$network,port:$port,domain:$domain,tls:$tls}' > "$PRESET_FILE"
-    # CORREÇÃO: 640 root:nogroup — mesmo padrão do config.json.
-    chmod 640 "$PRESET_FILE"
+    chmod 777 "$PRESET_FILE"
     chown root:"$XRAY_GROUP" "$PRESET_FILE"
 
     echo "$domain" > "$ACTIVE_DOMAIN_FILE"
@@ -400,15 +338,17 @@ func_generate_config() {
     echo ""
     echo "========================================="
     echo -e " ${TXT_YELLOW}PROTOCOLO:${RESET}   ${TXT_CYAN}${network^^}${RESET}"
-    echo -e " ${TXT_YELLOW}DOMÍNIO/SNI:${RESET} ${TXT_CYAN}${domain}${RESET}"
-    echo -e " ${TXT_YELLOW}PORTA:${RESET}       ${TXT_CYAN}${port}${RESET}"
-    echo -e " ${TXT_YELLOW}API INTERNA:${RESET} ${TXT_CYAN}127.0.0.1:${api_port}${RESET}"
-    echo -e " ${TXT_YELLOW}CRIPTOGRAFIA:${RESET} ${tls_msg}"
+    echo -e " ${TXT_YELLOW}DOMÍNIO/SNI:${RESET}   ${TXT_CYAN}${domain}${RESET}"
+    echo -e " ${TXT_YELLOW}PORTA:${RESET}         ${TXT_CYAN}${port}${RESET}"
+    echo -e " ${TXT_YELLOW}API INTERNA:${RESET}   ${TXT_CYAN}127.0.0.1:${api_port}${RESET}"
+    echo -e " ${TXT_YELLOW}CRIPTOGRAFIA:${RESET}  ${tls_msg}"
     echo "========================================="
     echo ""
 
     local sec="none"
-    if [ "$use_tls" = "true" ]; then sec="tls"; fi
+    if [ "$use_tls" = "true" ]; then
+        sec="tls"
+    fi
 
     local link=""
     case "$network" in
@@ -434,9 +374,7 @@ TLS=${use_tls}
 UUID=${uuid}
 LINK=${link}
 EOF
-    # CORREÇÃO: 600 root:root — contém UUID e link de conexão completo.
-    # 777 anterior expunha credenciais VPN a qualquer processo do sistema.
-    chmod 755 "$CONN_INFO_FILE"
+    chmod 777 "$CONN_INFO_FILE"
     chown root:root "$CONN_INFO_FILE"
 
     echo -e "${TXT_GREEN}Link salvo em: ${CONN_INFO_FILE}${RESET}"
@@ -461,7 +399,9 @@ func_wizard_install() {
     echo " [2] NÃO — Sem TLS (porta 80)"
     read -rp "Opção [1/2]: " tls_opt
     local use_tls="false"
-    if [ "${tls_opt:-2}" = "1" ]; then use_tls="true"; fi
+    if [ "${tls_opt:-2}" = "1" ]; then
+        use_tls="true"
+    fi
 
     header_blue "PASSO 3/5 — PORTA DE CONEXÃO"
     if [ "$use_tls" = "true" ]; then
@@ -470,15 +410,15 @@ func_wizard_install() {
         echo -e "Sugestões: ${TXT_CYAN}80, 8080, 8880${RESET}"
     fi
     read -rp "Porta [Enter = padrão]: " pub_port
-
+    
     if [ -z "${pub_port:-}" ]; then
         if [ "$use_tls" = "true" ]; then pub_port="443"; else pub_port="80"; fi
     fi
-
+    
     if ! validate_port "$pub_port"; then
         echo -e "${TXT_RED}❌ Porta inválida.${RESET}"; read -rp "Enter..."; return 1
     fi
-
+    
     if port_in_use "$pub_port"; then
         echo -e "${TXT_RED}⚠  Porta ${pub_port} em uso.${RESET}"
         read -rp "Continuar mesmo assim? [s/N]: " force
@@ -492,7 +432,6 @@ func_wizard_install() {
     if [ "$use_tls" = "true" ]; then
         echo -e "${TXT_YELLOW}Digite o domínio (ex: meusite.com):${RESET}"
         read -rp "Domínio: " domain_val
-        domain_val="$(echo "${domain_val:-}" | tr -d '[:space:][:cntrl:]')"
         if ! validate_domain "$domain_val"; then
             echo -e "${TXT_RED}❌ Domínio inválido.${RESET}"; read -rp "Enter..."; return 1
         fi
@@ -505,19 +444,16 @@ func_wizard_install() {
             echo -e "${TXT_RED}❌ Certificado não gerado.${RESET}"; read -rp "Enter..."; return 1
         fi
     else
-        echo -e "${TXT_YELLOW}IP público da VPS ou domínio (sem TLS):${RESET}"
+        echo -e "${TXT_YELLOW}IP da VPS ou domínio (sem TLS):${RESET}"
         read -rp "Endereço [Enter = detectar IP]: " domain_val
-        domain_val="$(echo "${domain_val:-}" | tr -d '[:space:][:cntrl:]')" 
         if [ -z "${domain_val:-}" ]; then
             echo -n "Detectando IP... "
             domain_val=$(curl -fsSL --max-time 10 "https://icanhazip.com" 2>/dev/null || \
                          curl -fsSL --max-time 10 "https://api.ipify.org"  2>/dev/null || echo "")
             echo "${domain_val:-falhou}"
         fi
-        # CORREÇÃO: validate_domain_or_ip agora rejeita IPs privados/reservados.
         if ! validate_domain_or_ip "$domain_val"; then
-            echo -e "${TXT_RED}❌ Endereço inválido ou não-roteável (IPs privados/loopback não são aceitos).${RESET}"
-            read -rp "Enter..."; return 1
+            echo -e "${TXT_RED}❌ Endereço inválido.${RESET}"; read -rp "Enter..."; return 1
         fi
     fi
 
@@ -555,14 +491,12 @@ func_wizard_install() {
     echo "========================================="
     echo ""
     read -rp "Confirmar e aplicar? [s/N]: " confirm
-
+    
     if [[ ! "${confirm:-n}" =~ ^[Ss]$ ]]; then
         echo "Cancelado."; sleep 1; return 0
     fi
 
-    # CORREÇÃO: api_port removida dos argumentos — func_generate_config resolve internamente
-    # via _find_free_api_port(), evitando o hardcode de 1080 e o fallback broken.
-    func_generate_config "$pub_port" "$selected_net" "$domain_val" "$use_tls"
+    func_generate_config "$pub_port" "$selected_net" "$domain_val" "1080" "$use_tls"
 }
 
 func_wizard_install

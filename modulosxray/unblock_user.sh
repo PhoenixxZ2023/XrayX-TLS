@@ -1,13 +1,11 @@
 #!/bin/bash
-# unblock_user.sh - DragonCore V7.5.1
-# Correções aplicadas:
-#   - _apply_config_perms() centralizada — rollbacks agora incluem chown root:nogroup
-#   - _cleanup() + trap EXIT desde o início — elimina trap tardio após mktemp
-#   - _wait_xray_active() com retry de 5s — substitui sleep 1 + is-active simples
-#   - user_input normalizado para minúsculas — consistente com add_user.sh corrigido
-#   - Verificação extra do UUID restaurado no JSON antes do restart
+# unblock_user.sh - Desbloqueio Seguro V7.5
+# Correções: backup + jq empty antes do mv, validação do UUID restaurado,
+#            verificação de restart + rollback, permissões no config,
+#            UUID truncado na exibição, detecção de distro.
 
 set -Eeuo pipefail
+trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
 
 USER_DB="/opt/XrayTools/users.db"
 CONFIG_PATH="/usr/local/etc/xray/config.json"
@@ -20,24 +18,6 @@ TXT_YELLOW='\033[1;33m'
 RESET='\033[0m'
 
 export DEBIAN_FRONTEND=noninteractive
-
-# --- CLEANUP CENTRALIZADO ---
-# CORREÇÃO: registrado no início via trap EXIT — cobre toda saída (normal, ERR, sinal).
-# Elimina o trap EXIT tardio que só protegia após o mktemp.
-_tmp_cfg=""
-_cleanup() {
-    rm -f "$_tmp_cfg"
-}
-trap '_cleanup' EXIT
-trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
-
-# --- PERMISSÕES DO CONFIG ---
-# CORREÇÃO: centralizada — garante chmod 640 + chown root:nogroup em fluxo normal
-# e em todos os rollbacks, evitando que um rollback deixe dono errado.
-_apply_config_perms() {
-    chmod 0660 "$CONFIG_PATH"
-    chown root:nogroup "$CONFIG_PATH"
-}
 
 # --- DETECÇÃO DE DISTRO ---
 _PKG_MANAGER=""
@@ -64,31 +44,18 @@ ensure_cmd() {
     esac
 }
 
-# CORREÇÃO: aceita entrada mista mas a normalização para minúsculas acontece
-# antes de qualquer busca — validate_nick só checa o formato.
 validate_nick() { [[ "${1:-}" =~ ^[a-zA-Z0-9]{5,9}$ ]]; }
 
+# Valida formato UUID padrão
 validate_uuid() {
     [[ "${1:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
-}
-
-# --- VERIFICAÇÃO DE XRAY ATIVO COM RETRY ---
-# CORREÇÃO: tenta por até 5s antes de concluir falha.
-# sleep 1 simples anterior causava falso negativo em sistemas sob carga.
-_wait_xray_active() {
-    local tries=5
-    while [ "$tries" -gt 0 ]; do
-        systemctl is-active --quiet xray 2>/dev/null && return 0
-        sleep 1
-        tries=$((tries - 1))
-    done
-    return 1
 }
 
 # --- INICIALIZAÇÃO ---
 : > "$LOG_FILE"
 ensure_cmd jq jq
 
+# Valida pré-condições
 if [ ! -s "$CONFIG_PATH" ]; then
     echo -e "${TXT_RED}❌ config.json não encontrado.${RESET}"
     sleep 2; exit 1
@@ -106,6 +73,7 @@ clear
 echo -e "${TXT_GREEN}🔓 DESBLOQUEAR USUÁRIO (REATIVAR)${RESET}"
 echo ""
 
+# Lista usuários BLOQUEADOS via jq (sem grep)
 echo -e "${TXT_CYAN}--- Usuários Suspensos ---${RESET}"
 locked_list="$(
     jq -r '
@@ -124,6 +92,7 @@ if [ -z "${locked_list:-}" ]; then
     exit 0
 fi
 
+# Exibe sem o prefixo LOCKED_
 while IFS= read -r line; do
     [ -n "$line" ] || continue
     echo " • ${line#LOCKED_}"
@@ -134,17 +103,15 @@ echo ""
 read -rp "Usuário para desbloquear (0 para voltar): " user_input
 [ "${user_input:-0}" = "0" ] || [ -z "${user_input:-}" ] && exit 0
 
+# Valida formato do nick
 if ! validate_nick "$user_input"; then
     echo -e "${TXT_RED}❌ Nick inválido. Use 5-9 letras/números.${RESET}"
     sleep 2; exit 1
 fi
 
-# CORREÇÃO: normaliza para minúsculas antes de qualquer busca —
-# consistente com add_user.sh que grava nomes em minúsculas no DB.
-user_input=$(echo "$user_input" | tr '[:upper:]' '[:lower:]')
-
 LOCKED_NAME="LOCKED_${user_input}"
 
+# Confirma que está bloqueado no config
 if ! jq -e --arg lock "$LOCKED_NAME" '
     any(.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?; .email == $lock)
 ' "$CONFIG_PATH" >/dev/null 2>&1; then
@@ -152,6 +119,7 @@ if ! jq -e --arg lock "$LOCKED_NAME" '
     sleep 2; exit 1
 fi
 
+# Recupera UUID real do DB
 echo "Recuperando dados originais..."
 REAL_UUID="$(awk -F'|' -v u="$user_input" '$1==u {print $2; exit}' "$USER_DB" 2>/dev/null || true)"
 
@@ -161,72 +129,69 @@ if [ -z "${REAL_UUID:-}" ]; then
     sleep 3; exit 1
 fi
 
+# Valida formato do UUID recuperado antes de usar
 if ! validate_uuid "$REAL_UUID"; then
     echo -e "${TXT_RED}❌ UUID no users.db está corrompido: '${REAL_UUID}'${RESET}"
     echo -e "${TXT_YELLOW}   Recrie o usuário com add_user.sh.${RESET}"
     sleep 3; exit 1
 fi
 
+# Confirmação antes de desbloquear
 echo ""
 echo -e "${TXT_YELLOW}⚠  Reativar acesso de '${user_input}'?${RESET}"
 read -rp "Confirmar? [s/N]: " confirm
 [[ "${confirm:-n}" =~ ^[Ss]$ ]] || { echo "Cancelado."; sleep 1; exit 0; }
 
+# Backup do config antes de modificar
 cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
 
-_tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
+# Grava em tmp, valida JSON, aplica atomicamente
+tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
+trap 'rm -f "$tmp_cfg"' EXIT
 
-jq --arg nick   "$user_input" \
-   --arg locked "$LOCKED_NAME" \
-   --arg uuid   "$REAL_UUID" '
+jq --arg nick    "$user_input" \
+   --arg locked  "$LOCKED_NAME" \
+   --arg uuid    "$REAL_UUID" '
     (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
         (if type == "array" then . else [] end)
     |
     (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
         map(if .email == $locked then .email = $nick | .id = $uuid else . end)
-' "$CONFIG_PATH" > "$_tmp_cfg" 2>>"$LOG_FILE"
+' "$CONFIG_PATH" > "$tmp_cfg" 2>>"$LOG_FILE"
 
-if ! jq empty "$_tmp_cfg" 2>/dev/null; then
+# Valida JSON resultante antes de aplicar
+if ! jq empty "$tmp_cfg" 2>/dev/null; then
+    rm -f "$tmp_cfg"
     echo -e "${TXT_RED}❌ Erro interno: JSON inválido gerado. Config não alterado.${RESET}"
     sleep 2; exit 1
 fi
 
-# CORREÇÃO: verificação extra — confirma que o UUID foi de fato restaurado no JSON
-# antes de aplicar, adicionando uma camada de segurança além do jq empty.
-if ! jq -e --arg nick "$user_input" --arg uuid "$REAL_UUID" '
-    any(.inbounds[]? | select(.tag=="inbound-dragoncore").settings.clients[]?;
-        .email == $nick and .id == $uuid)
-' "$_tmp_cfg" >/dev/null 2>&1; then
-    echo -e "${TXT_RED}❌ Verificação pós-geração falhou: UUID não restaurado corretamente.${RESET}"
-    sleep 2; exit 1
-fi
+# Aplica e corrige permissões
+mv -f "$tmp_cfg" "$CONFIG_PATH"
+chmod 0640 "$CONFIG_PATH"
+chown root:nogroup "$CONFIG_PATH"
 
-mv -f "$_tmp_cfg" "$CONFIG_PATH"
-_tmp_cfg=""   # já movido — _cleanup não deve tentar remover
-_apply_config_perms
-
-# Restart com rollback em falha
+# Restart com verificação e rollback em falha
 if ! systemctl try-reload-or-restart xray >/dev/null 2>&1 && \
    ! systemctl restart xray >/dev/null 2>&1; then
     echo -e "${TXT_RED}❌ Falha ao reiniciar Xray. Revertendo config...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    # CORREÇÃO: rollback usa _apply_config_perms() — garante 640 + chown corretos.
-    _apply_config_perms
+    chmod 0640 "$CONFIG_PATH"
     echo -e "${TXT_YELLOW}Config revertido. Usuário permanece bloqueado.${RESET}"
     journalctl -u xray -n 15 --no-pager 2>/dev/null || true
     sleep 3; exit 1
 fi
 
-# CORREÇÃO: retry de até 5s para confirmar xray ativo.
-if ! _wait_xray_active; then
+sleep 1
+if ! systemctl is-active --quiet xray 2>/dev/null; then
     echo -e "${TXT_RED}❌ Xray não ficou ativo. Revertendo...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    # CORREÇÃO: rollback usa _apply_config_perms() — garante 640 + chown corretos.
-    _apply_config_perms
+    chmod 0640 "$CONFIG_PATH"
     systemctl restart xray >/dev/null 2>&1 || true
     sleep 2; exit 1
 fi
 
+# UUID truncado na exibição — não expõe credencial completa no terminal
 UUID_DISPLAY="${REAL_UUID:0:8}...${REAL_UUID: -4}"
 
 echo ""

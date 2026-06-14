@@ -1,25 +1,19 @@
 #!/bin/bash
-# remover_expirados.sh - DragonCore V7.5.1
-# Correções aplicadas:
-#   - _cleanup() separado da mensagem de erro — não exibe [ERRO] em saída normal
-#   - chmod 777 → _apply_config_perms() (640 root:nogroup) nos 3 pontos
-#   - Rollbacks usam _apply_config_perms() — garante chown correto
-#   - _wait_xray_active() com retry de 5s — substitui sleep 1 + is-active simples
-#   - Passo 3 reutiliza expired_nicks_file — elimina dupla execução de is_expired()
-#   - _TMP_FILES limpo após mv -f — cleanup não tenta deletar arquivos já promovidos
-#   - chmod 600 explícito no USER_DB após mv
+# remover_expirados.sh - Limpeza de Usuários Vencidos V7.5
+# Correções: ordem correta (config primeiro, DB depois), backup + jq empty,
+#            verificação de restart + rollback coordenado, comparação de datas
+#            robusta via date +%s, limpeza de arquivos de info, detecção de distro.
 
 set -Eeuo pipefail
 
-# --- CLEANUP CENTRALIZADO ---
-# CORREÇÃO: _cleanup() apenas remove tmpfiles — sem mensagem de erro.
-# A mensagem de erro fica exclusivamente no trap ERR, que só dispara em falhas reais.
-# trap EXIT com mensagem de erro causava exibição de "[ERRO]" em saída normal (exit 0).
+# Arquivos temporários para cleanup no EXIT
 _TMP_FILES=()
+trap '_cleanup' EXIT
 _cleanup() {
     for f in "${_TMP_FILES[@]:-}"; do rm -f "$f" 2>/dev/null || true; done
+    echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)" 2>/dev/null || true
 }
-trap '_cleanup' EXIT
+# Sobrescreve trap somente para ERR
 trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
 
 USER_DB="/opt/XrayTools/users.db"
@@ -35,13 +29,6 @@ TITLE_BAR='\033[1;47;34m'
 RESET='\033[0m'
 
 export DEBIAN_FRONTEND=noninteractive
-
-# --- PERMISSÕES DO CONFIG ---
-# CORREÇÃO: centralizada — 640 root:nogroup em fluxo normal e todos os rollbacks.
-_apply_config_perms() {
-    chmod 0640 "$CONFIG_PATH"
-    chown root:nogroup "$CONFIG_PATH"
-}
 
 # --- DETECÇÃO DE DISTRO ---
 _PKG_MANAGER=""
@@ -69,26 +56,15 @@ ensure_cmd() {
 }
 
 # --- COMPARAÇÃO DE DATA ROBUSTA ---
-# Retorna 0 se $1 (YYYY-MM-DD) é anterior a hoje (timestamp Unix)
+# Retorna 0 se $1 (YYYY-MM-DD) é anterior a hoje
 is_expired() {
     local expiry="$1"
+    # Valida formato
     [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
     local exp_ts today_ts
     exp_ts=$(date -d "$expiry" +%s 2>/dev/null) || return 1
     today_ts=$(date +%s)
     [ "$exp_ts" -lt "$today_ts" ]
-}
-
-# --- VERIFICAÇÃO DE XRAY ATIVO COM RETRY ---
-# CORREÇÃO: tenta por até 5s — evita falso negativo em sistema sob carga.
-_wait_xray_active() {
-    local tries=5
-    while [ "$tries" -gt 0 ]; do
-        systemctl is-active --quiet xray 2>/dev/null && return 0
-        sleep 1
-        tries=$((tries - 1))
-    done
-    return 1
 }
 
 # --- INICIALIZAÇÃO ---
@@ -99,6 +75,7 @@ clear
 echo -e "${TITLE_BAR}   LIMPEZA DE EXPIRADOS   ${RESET}"
 echo ""
 
+# Pré-condições
 if [ ! -f "$USER_DB" ] || [ ! -s "$USER_DB" ]; then
     echo "Banco de dados vazio ou inexistente."
     read -rp "Enter para voltar..."; exit 0
@@ -121,7 +98,7 @@ echo ""
 printf "%-20s | %s\n" "USUÁRIO" "VENCIMENTO"
 echo "-----------------------------------"
 
-# Coleta expirados em arquivos temporários registrados para cleanup
+# Coleta expirados: nick, uuid e data
 expired_uuids_file=$(mktemp /tmp/expired_uuids_XXXXXX)
 expired_nicks_file=$(mktemp /tmp/expired_nicks_XXXXXX)
 _TMP_FILES+=("$expired_uuids_file" "$expired_nicks_file")
@@ -149,9 +126,11 @@ echo -e "Encontrados ${TXT_RED}${count}${RESET} usuário(s) vencido(s)."
 read -rp "Excluir agora? [s/N]: " confirm
 [[ "${confirm:-n}" =~ ^[Ss]$ ]] || { echo "Cancelado."; sleep 1; exit 0; }
 
-# --- PASSO 1: MODIFICA CONFIG ---
+# --- PASSO 1: MODIFICA CONFIG PRIMEIRO ---
+# Monta array JSON de UUIDs expirados
 expired_json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$expired_uuids_file")
 
+# Backup do config
 cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
 
 tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
@@ -165,17 +144,16 @@ jq --argjson dead "$expired_json" '
     map(select((.id as $id | ($dead | index($id)) == null)))
 ' "$CONFIG_PATH" > "$tmp_cfg" 2>>"$LOG_FILE"
 
+# Valida JSON resultante antes de aplicar
 if ! jq empty "$tmp_cfg" 2>/dev/null; then
     echo -e "${TXT_RED}❌ JSON inválido gerado. Config não alterado.${RESET}"
     sleep 2; exit 1
 fi
 
+# Aplica atomicamente com permissões corretas
 mv -f "$tmp_cfg" "$CONFIG_PATH"
-# CORREÇÃO: remove da lista de cleanup — arquivo foi promovido para config.json,
-# não é mais temporário. Sem isso, _cleanup tentaria deletar o config.json.
-_TMP_FILES=("${_TMP_FILES[@]/$tmp_cfg}")
-# CORREÇÃO: _apply_config_perms() em vez de chmod 777.
-_apply_config_perms
+chmod 777 "$CONFIG_PATH"
+chown root:nogroup "$CONFIG_PATH"
 
 # --- PASSO 2: RESTART COM VERIFICAÇÃO ---
 echo -e "Reiniciando Xray..."
@@ -183,35 +161,28 @@ if ! systemctl try-reload-or-restart xray >/dev/null 2>&1 && \
    ! systemctl restart xray >/dev/null 2>&1; then
     echo -e "${TXT_RED}❌ Falha ao reiniciar Xray. Revertendo config...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    # CORREÇÃO: rollback usa _apply_config_perms() — não volta para 777.
-    _apply_config_perms
+    chmod 777 "$CONFIG_PATH"
     journalctl -u xray -n 15 --no-pager 2>/dev/null || true
     echo -e "${TXT_YELLOW}Config revertido. Nenhum usuário foi removido.${RESET}"
     sleep 3; exit 1
 fi
 
-# CORREÇÃO: retry de até 5s para confirmar xray ativo.
-if ! _wait_xray_active; then
+sleep 1
+if ! systemctl is-active --quiet xray 2>/dev/null; then
     echo -e "${TXT_RED}❌ Xray não ficou ativo. Revertendo config...${RESET}"
     mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    # CORREÇÃO: rollback usa _apply_config_perms() — não volta para 777.
-    _apply_config_perms
+    chmod 777 "$CONFIG_PATH"
     systemctl restart xray >/dev/null 2>&1 || true
     sleep 2; exit 1
 fi
 
-# --- PASSO 3: ATUALIZA O DB (após restart confirmado) ---
-# CORREÇÃO: reutiliza expired_nicks_file já coletado no Passo 1 em vez de
-# reler o DB e reexecutar is_expired() — elimina risco de divergência de clock
-# entre os dois loops (ex: NTP sync em VM durante a execução).
+# --- PASSO 3: SÓ AGORA ATUALIZA O DB (restart confirmado) ---
 tmp_db=$(mktemp "${USER_DB}.tmp.XXXXXX")
 _TMP_FILES+=("$tmp_db")
 
-# Filtra o DB removendo os nicks expirados já identificados
-# grep -vFf: remove linhas que iniciam com qualquer nick do arquivo de expirados
 while IFS='|' read -r nick uuid expiry _rest; do
     [ -n "${nick:-}" ] && [ -n "${uuid:-}" ] || continue
-    if ! grep -qxF "$nick" "$expired_nicks_file" 2>/dev/null; then
+    if ! is_expired "${expiry:-}"; then
         echo "${nick}|${uuid}|${expiry:-}" >> "$tmp_db"
     else
         echo -e " ${TXT_RED}Removido DB:${RESET} ${nick}"
@@ -219,20 +190,14 @@ while IFS='|' read -r nick uuid expiry _rest; do
 done < "$USER_DB"
 
 mv -f "$tmp_db" "$USER_DB"
-# CORREÇÃO: remove da lista de cleanup — arquivo promovido para users.db.
-_TMP_FILES=("${_TMP_FILES[@]/$tmp_db}")
-# CORREÇÃO: permissão explícita no DB — independe da umask do processo.
-chmod 600 "$USER_DB"
 
-# --- PASSO 4: LIMPA ARQUIVOS DE INFO ---
+# --- PASSO 4: LIMPA ARQUIVOS DE INFO DOS USUÁRIOS REMOVIDOS ---
 if [ -d "$CONN_INFO_DIR" ] && [ -s "$expired_nicks_file" ]; then
     while IFS= read -r nick; do
         [ -n "$nick" ] || continue
         local_info="${CONN_INFO_DIR}/${nick}.txt"
-        if [ -f "$local_info" ]; then
-            rm -f "$local_info"
+        [ -f "$local_info" ] && rm -f "$local_info" && \
             echo -e " ${TXT_CYAN}Arquivo removido:${RESET} ${nick}.txt"
-        fi
     done < "$expired_nicks_file"
 fi
 
