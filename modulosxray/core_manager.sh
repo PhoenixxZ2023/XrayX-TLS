@@ -27,7 +27,7 @@ XRAY_GROUP="nogroup"
 
 # Porta API configurável via variável de ambiente.
 # Padrão 1080 — porta padrão do projeto DragonCore.
-API_PORT="${XRAY_API_PORT:-1080}"
+API_PORT="${XRAY_API_PORT:-1085}"
 
 _validate_repo_base() {
     local url="$1"
