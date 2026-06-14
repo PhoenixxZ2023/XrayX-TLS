@@ -1,96 +1,33 @@
 #!/bin/bash
-# remover_expirados.sh - Limpeza de Usuários Vencidos V7.5
-# Correções: ordem correta (config primeiro, DB depois), backup + jq empty,
-#            verificação de restart + rollback coordenado, comparação de datas
-#            robusta via date +%s, limpeza de arquivos de info, detecção de distro.
+# remover_expirados.sh - Limpeza de Usuários Vencidos
+# Baseado na sua lógica original.
 
-set -Eeuo pipefail
+set -euo pipefail
 
-# Arquivos temporários para cleanup no EXIT
-_TMP_FILES=()
-trap '_cleanup' EXIT
-_cleanup() {
-    for f in "${_TMP_FILES[@]:-}"; do rm -f "$f" 2>/dev/null || true; done
-    echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)" 2>/dev/null || true
-}
-# Sobrescreve trap somente para ERR
-trap 'echo -e "\n\033[1;31m[ERRO]\033[0m Falha na linha $LINENO (código: $?)"; sleep 2' ERR
-
+# --- CONFIGURAÇÕES ---
 USER_DB="/opt/XrayTools/users.db"
 CONFIG_PATH="/usr/local/etc/xray/config.json"
-CONN_INFO_DIR="/opt/XrayTools/users"
-LOG_FILE="/tmp/remover_expirados.log"
 
+# --- CORES ---
 TXT_GREEN='\033[1;32m'
 TXT_RED='\033[1;31m'
 TXT_YELLOW='\033[1;33m'
-TXT_CYAN='\033[1;36m'
 TITLE_BAR='\033[1;47;34m'
 RESET='\033[0m'
 
-export DEBIAN_FRONTEND=noninteractive
-
-# --- DETECÇÃO DE DISTRO ---
-_PKG_MANAGER=""
-_APT_UPDATED=0
-_detect_pkg_manager() {
-    [ -n "$_PKG_MANAGER" ] && return
-    if   command -v apt-get &>/dev/null; then _PKG_MANAGER="apt"
-    elif command -v dnf     &>/dev/null; then _PKG_MANAGER="dnf"
-    elif command -v yum     &>/dev/null; then _PKG_MANAGER="yum"
-    elif command -v pacman  &>/dev/null; then _PKG_MANAGER="pacman"
-    else echo -e "${TXT_RED}❌ Gerenciador de pacotes não detectado.${RESET}"; exit 1; fi
-}
-
-ensure_cmd() {
-    local cmd="$1" pkg="$2"
-    command -v "$cmd" &>/dev/null && return 0
-    _detect_pkg_manager
-    case "$_PKG_MANAGER" in
-        apt)
-            [ "$_APT_UPDATED" -eq 0 ] && { apt-get update -y >>"$LOG_FILE" 2>&1 || true; _APT_UPDATED=1; }
-            apt-get install -y "$pkg" >>"$LOG_FILE" 2>&1 ;;
-        dnf|yum) "$_PKG_MANAGER" install -y "$pkg" >>"$LOG_FILE" 2>&1 ;;
-        pacman)  pacman -Sy --noconfirm "$pkg"      >>"$LOG_FILE" 2>&1 ;;
-    esac
-}
-
-# --- COMPARAÇÃO DE DATA ROBUSTA ---
-# Retorna 0 se $1 (YYYY-MM-DD) é anterior a hoje
-is_expired() {
-    local expiry="$1"
-    # Valida formato
-    [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
-    local exp_ts today_ts
-    exp_ts=$(date -d "$expiry" +%s 2>/dev/null) || return 1
-    today_ts=$(date +%s)
-    [ "$exp_ts" -lt "$today_ts" ]
-}
-
-# --- INICIALIZAÇÃO ---
-: > "$LOG_FILE"
-ensure_cmd jq jq
-
+# --- INÍCIO ---
 clear
 echo -e "${TITLE_BAR}   LIMPEZA DE EXPIRADOS   ${RESET}"
 echo ""
 
-# Pré-condições
+today=$(date +%F)
+count=0
+
+# Verifica se o DB existe e tem conteúdo
 if [ ! -f "$USER_DB" ] || [ ! -s "$USER_DB" ]; then
-    echo "Banco de dados vazio ou inexistente."
-    read -rp "Enter para voltar..."; exit 0
-fi
-if [ ! -s "$CONFIG_PATH" ]; then
-    echo -e "${TXT_RED}❌ config.json não encontrado.${RESET}"
-    read -rp "Enter para voltar..."; exit 1
-fi
-if ! jq empty "$CONFIG_PATH" 2>/dev/null; then
-    echo -e "${TXT_RED}❌ config.json inválido.${RESET}"
-    read -rp "Enter para voltar..."; exit 1
-fi
-if ! jq -e '.inbounds[]? | select(.tag=="inbound-dragoncore")' "$CONFIG_PATH" >/dev/null 2>&1; then
-    echo -e "${TXT_RED}❌ inbound-dragoncore não encontrado no config.${RESET}"
-    read -rp "Enter para voltar..."; exit 1
+    echo "Banco de dados vazio."
+    read -rp "Enter para voltar..."
+    exit 0
 fi
 
 echo -e "${TXT_YELLOW}Verificando vencimentos...${RESET}"
@@ -98,109 +35,61 @@ echo ""
 printf "%-20s | %s\n" "USUÁRIO" "VENCIMENTO"
 echo "-----------------------------------"
 
-# Coleta expirados: nick, uuid e data
-expired_uuids_file=$(mktemp /tmp/expired_uuids_XXXXXX)
-expired_nicks_file=$(mktemp /tmp/expired_nicks_XXXXXX)
-_TMP_FILES+=("$expired_uuids_file" "$expired_nicks_file")
+found=false
 
-count=0
-while IFS='|' read -r nick uuid expiry _rest; do
-    [ -n "${nick:-}" ] && [ -n "${uuid:-}" ] || continue
-    if is_expired "${expiry:-}"; then
-        printf "${TXT_RED}%-20s${RESET} | ${TXT_RED}%s${RESET}\n" "$nick" "${expiry:-sem data}"
-        echo "$uuid" >> "$expired_uuids_file"
-        echo "$nick" >> "$expired_nicks_file"
-        count=$(( count + 1 ))
+# 1. Primeira Passada: Apenas LISTAR
+while IFS='|' read -r nick uuid expiry; do
+    # Valida formato de data e compara string (YYYY-MM-DD funciona com < no bash)
+    if [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "$expiry" < "$today" ]]; then
+        printf "${TXT_RED}%-20s${RESET} | ${TXT_RED}%s${RESET}\n" "$nick" "$expiry"
+        found=true
+        ((count++))
     fi
 done < "$USER_DB"
 
 echo "-----------------------------------"
 echo ""
 
-if [ "$count" -eq 0 ]; then
-    echo -e "${TXT_GREEN}✅ Nenhum usuário vencido.${RESET}"
-    read -rp "Enter para voltar..."; exit 0
+if [ "$found" = false ]; then
+    echo -e "${TXT_GREEN}Nenhum usuário vencido.${RESET}"
+    read -rp "Enter para voltar..."
+    exit 0
 fi
 
-echo -e "Encontrados ${TXT_RED}${count}${RESET} usuário(s) vencido(s)."
-read -rp "Excluir agora? [s/N]: " confirm
-[[ "${confirm:-n}" =~ ^[Ss]$ ]] || { echo "Cancelado."; sleep 1; exit 0; }
-
-# --- PASSO 1: MODIFICA CONFIG PRIMEIRO ---
-# Monta array JSON de UUIDs expirados
-expired_json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$expired_uuids_file")
-
-# Backup do config
-cp -f "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-
-tmp_cfg=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
-_TMP_FILES+=("$tmp_cfg")
-
-jq --argjson dead "$expired_json" '
-  (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
-    (if type == "array" then . else [] end)
-  |
-  (.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |=
-    map(select((.id as $id | ($dead | index($id)) == null)))
-' "$CONFIG_PATH" > "$tmp_cfg" 2>>"$LOG_FILE"
-
-# Valida JSON resultante antes de aplicar
-if ! jq empty "$tmp_cfg" 2>/dev/null; then
-    echo -e "${TXT_RED}❌ JSON inválido gerado. Config não alterado.${RESET}"
-    sleep 2; exit 1
+echo -e "Encontrados ${TXT_RED}${count}${RESET} usuários vencidos."
+read -rp "Excluir agora? [s/n]: " confirm
+if [[ "$confirm" != "s" && "$confirm" != "S" ]]; then
+    echo "Cancelado."
+    sleep 2
+    exit 0
 fi
 
-# Aplica atomicamente com permissões corretas
-mv -f "$tmp_cfg" "$CONFIG_PATH"
-chmod 777 "$CONFIG_PATH"
-chown root:nogroup "$CONFIG_PATH"
+# 2. Segunda Passada: REMOVER
+# Cria arquivo temporário vazio
+> "${USER_DB}.tmp"
 
-# --- PASSO 2: RESTART COM VERIFICAÇÃO ---
-echo -e "Reiniciando Xray..."
-if ! systemctl try-reload-or-restart xray >/dev/null 2>&1 && \
-   ! systemctl restart xray >/dev/null 2>&1; then
-    echo -e "${TXT_RED}❌ Falha ao reiniciar Xray. Revertendo config...${RESET}"
-    mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    chmod 777 "$CONFIG_PATH"
-    journalctl -u xray -n 15 --no-pager 2>/dev/null || true
-    echo -e "${TXT_YELLOW}Config revertido. Nenhum usuário foi removido.${RESET}"
-    sleep 3; exit 1
-fi
-
-sleep 1
-if ! systemctl is-active --quiet xray 2>/dev/null; then
-    echo -e "${TXT_RED}❌ Xray não ficou ativo. Revertendo config...${RESET}"
-    mv -f "${CONFIG_PATH}.bak" "$CONFIG_PATH"
-    chmod 777 "$CONFIG_PATH"
-    systemctl restart xray >/dev/null 2>&1 || true
-    sleep 2; exit 1
-fi
-
-# --- PASSO 3: SÓ AGORA ATUALIZA O DB (restart confirmado) ---
-tmp_db=$(mktemp "${USER_DB}.tmp.XXXXXX")
-_TMP_FILES+=("$tmp_db")
-
-while IFS='|' read -r nick uuid expiry _rest; do
-    [ -n "${nick:-}" ] && [ -n "${uuid:-}" ] || continue
-    if ! is_expired "${expiry:-}"; then
-        echo "${nick}|${uuid}|${expiry:-}" >> "$tmp_db"
+echo ""
+while IFS='|' read -r nick uuid expiry; do
+    if [[ "$expiry" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "$expiry" < "$today" ]]; then
+        echo -e "Removendo: ${TXT_RED}${nick}${RESET}"
+        
+        # Remove do Xray Config (JSON)
+        jq --arg id "$uuid" \
+           '(.inbounds[] | select(.tag=="inbound-dragoncore").settings.clients) |= map(select(.id != $id))' \
+           "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+           
     else
-        echo -e " ${TXT_RED}Removido DB:${RESET} ${nick}"
+        # Se não venceu, mantém no DB novo
+        echo "${nick}|${uuid}|${expiry}" >> "${USER_DB}.tmp"
     fi
 done < "$USER_DB"
 
-mv -f "$tmp_db" "$USER_DB"
+# Substitui o DB antigo pelo novo (limpo)
+mv "${USER_DB}.tmp" "$USER_DB"
 
-# --- PASSO 4: LIMPA ARQUIVOS DE INFO DOS USUÁRIOS REMOVIDOS ---
-if [ -d "$CONN_INFO_DIR" ] && [ -s "$expired_nicks_file" ]; then
-    while IFS= read -r nick; do
-        [ -n "$nick" ] || continue
-        local_info="${CONN_INFO_DIR}/${nick}.txt"
-        [ -f "$local_info" ] && rm -f "$local_info" && \
-            echo -e " ${TXT_CYAN}Arquivo removido:${RESET} ${nick}.txt"
-    done < "$expired_nicks_file"
-fi
+# Reinicia para aplicar
+systemctl restart xray >/dev/null 2>&1 || true
 
 echo ""
-echo -e "${TXT_GREEN}✅ Limpeza concluída: ${count} usuário(s) removido(s).${RESET}"
+echo -e "${TXT_GREEN}Limpeza concluída com sucesso.${RESET}"
 read -rp "Enter para voltar..."
